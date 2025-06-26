@@ -1,0 +1,139 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# Build artifacts
+/bin/
+/build/
+/dist/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Coverage reports
+coverage.out
+coverage.html
+profile.out
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows specific
+*.lnk
+
+# macOS specific
+.AppleDouble
+.LSOverride
+
+# Linux specific
+*~
+
+# Archives
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Configuration files that might contain secrets
+config.local.*
+secrets.yaml
+secrets.yml
+
+# GitHub and community files (keep versioned ones, ignore local/temp ones)
+.github/workflows/*.local.yml
+.github/ISSUE_TEMPLATE/*.local.*
+
+# Local development and testing
+.env.example.local
+docker-compose.override.yml
+.docker/
+
+# Documentation build artifacts
+docs/_build/
+docs/.doctrees/
+site/
+
+# Release and distribution
+*.tar.gz
+*.deb
+*.rpm
+dist/
+release/
+
+# Local contributor tools
+.pre-commit-config.local.yaml
+.commitlintrc.local.*
+.golangci.local.yml
+
+# Dependency management
+go.work.sum
+go_modules_cache/
+
+# Security scanning results
+.snyk
+security-scan-results/
+
+# Local scripts and utilities
+scripts/local/
+tools/local/
+dev-tools/
+
+# Performance and profiling
+*.prof
+*.pprof
+cpu.out
+mem.out
+trace.out
+
+# Cross-compilation artifacts
+build/
+dist/
+releases/

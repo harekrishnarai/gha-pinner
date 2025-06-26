@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/harekrishnarai/gha-pinner/blob/main/README.md
+    about: Read the documentation for detailed usage instructions
+  - name: 💬 Discussions
+    url: https://github.com/harekrishnarai/gha-pinner/discussions
+    about: Ask questions and discuss ideas with the community
+  - name: 🔒 Security Issues
+    url: https://github.com/harekrishnarai/gha-pinner/security/advisories/new
+    about: Report security vulnerabilities privately
