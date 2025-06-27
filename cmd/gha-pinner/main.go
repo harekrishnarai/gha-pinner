@@ -206,20 +206,25 @@ func processOrganization(orgName string) error {
 	}
 
 	successCount, errorCount := 0, 0
-	for _, repo := range repos {
+	fmt.Printf("🏢 Processing %d repositories in organization: %s\n", len(repos), orgName)
+
+	for i, repo := range repos {
 		// Ensure we have the full repository name for cloning
 		fullRepoName := fmt.Sprintf("%s/%s", orgName, repo.Name)
 		repo.URL = fullRepoName
 
-		fmt.Printf("Processing repository: %s\n", fullRepoName)
+		fmt.Printf("\n[%d/%d] 🔍 Processing repository: %s\n", i+1, len(repos), fullRepoName)
 		if err := patchRepository(repo); err != nil {
-			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", fullRepoName, err)
+			fmt.Fprintf(os.Stderr, "❌ Error processing %s: %v\n", fullRepoName, err)
 			errorCount++
 		} else {
 			successCount++
 		}
 	}
-	fmt.Printf("\nProcessing complete. Success: %d, Errors: %d\n", successCount, errorCount)
+	fmt.Printf("\n🎯 Organization processing complete:\n")
+	fmt.Printf("   • ✅ Successful: %d repositories\n", successCount)
+	fmt.Printf("   • ❌ Failed: %d repositories\n", errorCount)
+	fmt.Printf("   • 📊 Total: %d repositories\n", len(repos))
 	return nil
 }
 
@@ -233,6 +238,8 @@ func resolveVersion(action, version string) error {
 }
 
 func patchRepository(repo Repository) error {
+	fmt.Printf("\n🔍 Analyzing repository: %s\n", repo.Name)
+
 	// Check repository permissions before proceeding
 	cloneTarget := repo.URL
 	if cloneTarget == "" {
@@ -293,7 +300,7 @@ func patchRepository(repo Repository) error {
 	}
 
 	if result := execCommandWithDir(repoDir, "git", "diff", "--exit-code"); result.ExitCode == 0 {
-		fmt.Printf("No changes needed for repository: %s\n", repo.Name)
+		fmt.Printf("✅ No changes needed for repository: %s - all actions are already properly secured\n", repo.Name)
 		return nil
 	}
 
@@ -306,7 +313,7 @@ func patchRepository(repo Repository) error {
 	commands := [][]string{
 		{"git", "checkout", "-b", branchName},
 		{"git", "add", ".github/workflows"},
-		{"git", "commit", "-m", "chore(security): pin actions to specific commits\n\nPin GitHub Actions to commit hashes for improved security and reproducible builds"},
+		{"git", "commit", "-m", getPRTitleForRepository(originalRepo) + "\n\nPin GitHub Actions to commit hashes for improved security and reproducible builds"},
 		{"git", "push", "origin", branchName},
 	}
 
@@ -326,17 +333,17 @@ func patchRepository(repo Repository) error {
 		searchRepo = cloneTarget
 	}
 
-	result := execCommand("gh", "pr", "list", "--repo", searchRepo, "--search", "chore(security): pin actions to specific commits in:title", "--state", "open", "--json", "title,url")
+	result := execCommand("gh", "pr", "list", "--repo", searchRepo, "--search", getPRSearchPattern(searchRepo), "--state", "open", "--json", "title,url")
 	if debug {
 		fmt.Printf("PR search in %s: exit=%d, output=%s\n", searchRepo, result.ExitCode, result.Stdout)
 	}
 
 	if result.ExitCode == 0 && strings.TrimSpace(result.Stdout) != "" && strings.TrimSpace(result.Stdout) != "[]" {
-		fmt.Printf("Pull request already exists for repository: %s\n", searchRepo)
+		fmt.Printf("ℹ️  Pull request already exists for repository: %s - skipping PR creation\n", searchRepo)
 		return nil
 	}
 
-	prTitle := "chore(security): pin actions to specific commits"
+	prTitle := getPRTitleForRepository(searchRepo)
 
 	// Get appropriate PR body based on repository's PR template
 	prBodyContent := getPRBodyForRepository(repoDir)
@@ -386,12 +393,13 @@ func patchRepository(repo Repository) error {
 		targetRepo = repo.Name
 	}
 
-	fmt.Printf("Pull request created for repository: %s\n", targetRepo)
+	fmt.Printf("🎉 Pull request created successfully!\n")
+	fmt.Printf("   • Repository: %s\n", targetRepo)
 	if needsFork {
-		fmt.Printf("Created from fork: %s\n", cloneTarget)
+		fmt.Printf("   • Fork used: %s\n", cloneTarget)
 	}
 	if prResult.Stdout != "" {
-		fmt.Printf("PR URL: %s\n", strings.TrimSpace(prResult.Stdout))
+		fmt.Printf("   • PR URL: %s\n", strings.TrimSpace(prResult.Stdout))
 	}
 	return nil
 }
@@ -518,9 +526,7 @@ func configureGitCredentials(repoDir string) error {
 func patchLocalRepository(repoDir string) error {
 	workflowsDir := filepath.Join(repoDir, ".github", "workflows")
 	if _, err := os.Stat(workflowsDir); os.IsNotExist(err) {
-		if debug {
-			fmt.Printf("No workflows directory found in: %s\n", repoDir)
-		}
+		fmt.Printf("ℹ️  No .github/workflows directory found - no GitHub Actions to pin\n")
 		return nil
 	}
 
@@ -529,43 +535,123 @@ func patchLocalRepository(repoDir string) error {
 		return fmt.Errorf("failed to read workflows directory: %v", err)
 	}
 
+	workflowFiles := []string{}
 	for _, file := range files {
 		if !file.IsDir() && (strings.HasSuffix(file.Name(), ".yml") || strings.HasSuffix(file.Name(), ".yaml")) {
-			if err := processWorkflowFile(filepath.Join(workflowsDir, file.Name())); err != nil {
+			workflowFiles = append(workflowFiles, file.Name())
+		}
+	}
+
+	if len(workflowFiles) == 0 {
+		fmt.Printf("ℹ️  No workflow files found in .github/workflows directory\n")
+		return nil
+	}
+
+	fmt.Printf("🔍 Found %d workflow file(s): %s\n", len(workflowFiles), strings.Join(workflowFiles, ", "))
+
+	totalActionsPinned := 0
+	totalActionsAlreadyPinned := 0
+	totalActionsSkipped := 0
+	totalActionsWithLatest := 0
+	totalActionsWithoutTags := 0
+	totalActionsFound := 0
+
+	for _, file := range files {
+		if !file.IsDir() && (strings.HasSuffix(file.Name(), ".yml") || strings.HasSuffix(file.Name(), ".yaml")) {
+			pinned, alreadyPinned, skipped, withLatest, withoutTags, totalActions, err := processWorkflowFile(filepath.Join(workflowsDir, file.Name()))
+			if err != nil {
 				return fmt.Errorf("failed to process workflow file %s: %v", file.Name(), err)
 			}
+			totalActionsPinned += pinned
+			totalActionsAlreadyPinned += alreadyPinned
+			totalActionsSkipped += skipped
+			totalActionsWithLatest += withLatest
+			totalActionsWithoutTags += withoutTags
+			totalActionsFound += totalActions
 		}
+	}
+
+	// Summary of actions processed
+	fmt.Printf("\n📊 Summary:\n")
+	fmt.Printf("   • Total actions found: %d\n", totalActionsFound)
+	fmt.Printf("   • Actions pinned: %d\n", totalActionsPinned)
+	fmt.Printf("   • Actions already pinned: %d\n", totalActionsAlreadyPinned)
+	fmt.Printf("   • Actions with @latest: %d\n", totalActionsWithLatest)
+	fmt.Printf("   • Actions without tag/ref: %d\n", totalActionsWithoutTags)
+	fmt.Printf("   • Actions skipped: %d\n", totalActionsSkipped)
+
+	if totalActionsPinned == 0 && totalActionsAlreadyPinned > 0 {
+		fmt.Printf("✅ All GitHub Actions are already properly pinned to commit hashes\n")
+	} else if totalActionsPinned == 0 && totalActionsAlreadyPinned == 0 && totalActionsSkipped > 0 {
+		fmt.Printf("ℹ️  No GitHub Actions found that need pinning (only local actions or already pinned)\n")
+	} else if totalActionsPinned == 0 {
+		fmt.Printf("ℹ️  No GitHub Actions found in workflow files\n")
+	}
+
+	if totalActionsWithLatest > 0 {
+		fmt.Printf("⚠️  Warning: %d action(s) using @latest tag detected - these should be pinned for better security\n", totalActionsWithLatest)
+	}
+
+	if totalActionsWithoutTags > 0 {
+		fmt.Printf("🚨 Security Warning: %d action(s) found without any tag/ref - these are insecure as they default to the mutable default branch\n", totalActionsWithoutTags)
 	}
 	return nil
 }
 
-func processWorkflowFile(filePath string) error {
+func processWorkflowFile(filePath string) (int, int, int, int, int, int, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %v", err)
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to read file: %v", err)
 	}
 
 	originalContent := string(content)
 	var workflow map[string]interface{}
 	if err := yaml.Unmarshal(content, &workflow); err != nil {
-		return fmt.Errorf("failed to parse YAML: %v", err)
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to parse YAML: %v", err)
 	}
 
 	jobs, ok := workflow["jobs"].(map[string]interface{})
 	if !ok {
-		return nil
+		return 0, 0, 0, 0, 0, 0, nil
 	}
 
 	// Collect all actions that need to be pinned
 	var actionsToPin []actionPin
+	var actionsAlreadyPinned int
+	var actionsSkipped int
+	var actionsWithLatest int
+	var actionsWithoutTags int
+	var totalActions int
+
 	for _, jobData := range jobs {
 		if job, ok := jobData.(map[string]interface{}); ok {
 			if steps, ok := job["steps"].([]interface{}); ok {
 				for _, stepData := range steps {
 					if step, ok := stepData.(map[string]interface{}); ok {
-						if uses, ok := step["uses"].(string); ok && uses != "" && !shouldSkipAction(uses) {
+						if uses, ok := step["uses"].(string); ok && uses != "" {
+							totalActions++
+
+							if shouldSkipAction(uses) {
+								actionsSkipped++
+								continue
+							}
+
+							// Check if already pinned (has commit hash)
+							if matched, _ := regexp.MatchString(`@[a-f0-9]{40}`, uses); matched {
+								actionsAlreadyPinned++
+								continue
+							}
+
+							// Check for @latest tag
+							if strings.Contains(uses, "@latest") {
+								actionsWithLatest++
+							}
+
 							if action, version, err := parseActionReference(uses); err == nil {
 								actionsToPin = append(actionsToPin, actionPin{action: action, version: version})
+							} else if strings.Contains(err.Error(), "action without tag/ref") {
+								// Action without tag/ref - this is insecure
+								actionsWithoutTags++
 							}
 						}
 					}
@@ -575,10 +661,14 @@ func processWorkflowFile(filePath string) error {
 	}
 
 	if len(actionsToPin) == 0 {
-		return nil
+		return 0, actionsAlreadyPinned, actionsSkipped, actionsWithLatest, actionsWithoutTags, totalActions, nil
 	}
 
 	// Process actions concurrently
+	if len(actionsToPin) > 0 {
+		fmt.Printf("🔄 Processing %d action(s) for pinning...\n", len(actionsToPin))
+	}
+
 	numWorkers := runtime.NumCPU()
 	if numWorkers > len(actionsToPin) {
 		numWorkers = len(actionsToPin)
@@ -616,6 +706,7 @@ func processWorkflowFile(filePath string) error {
 	// Apply updates to the content
 	updatedContent := originalContent
 	currentDate := time.Now().Format("2006-01-02")
+	actionsPinned := 0
 
 	for _, jobData := range jobs {
 		if job, ok := jobData.(map[string]interface{}); ok {
@@ -629,6 +720,7 @@ func processWorkflowFile(filePath string) error {
 									if pinned.err == nil {
 										pinnedUses := fmt.Sprintf("%s@%s # %s on %s", action, pinned.hash, pinned.resolvedVersion, currentDate)
 										updatedContent = strings.Replace(updatedContent, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", pinnedUses), 1)
+										actionsPinned++
 										if debug {
 											fmt.Printf("Pinned %s@%s to %s\n", action, version, pinned.hash)
 										}
@@ -648,19 +740,18 @@ func processWorkflowFile(filePath string) error {
 
 	if updatedContent != originalContent {
 		if err := os.WriteFile(filePath, []byte(updatedContent), 0644); err != nil {
-			return fmt.Errorf("failed to write updated file: %v", err)
+			return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to write updated file: %v", err)
 		}
 	}
-	return nil
+	return actionsPinned, actionsAlreadyPinned, actionsSkipped, actionsWithLatest, actionsWithoutTags, totalActions, nil
 }
 
 func shouldSkipAction(uses string) bool {
+	// Skip local actions (relative paths)
 	if strings.HasPrefix(uses, "./") {
 		return true
 	}
-	if matched, _ := regexp.MatchString(`@[a-f0-9]{40}`, uses); matched {
-		return true
-	}
+	// Skip certain action patterns if configured
 	for _, skip := range skipActions {
 		if strings.Contains(uses, skip) {
 			return true
@@ -671,6 +762,10 @@ func shouldSkipAction(uses string) bool {
 
 func parseActionReference(uses string) (string, string, error) {
 	parts := strings.Split(uses, "@")
+	if len(parts) == 1 {
+		// Action without tag/ref - this is insecure as it defaults to default branch
+		return parts[0], "", fmt.Errorf("action without tag/ref")
+	}
 	if len(parts) != 2 {
 		return "", "", fmt.Errorf("invalid action reference format")
 	}
@@ -998,6 +1093,27 @@ func fillPRTemplate(template string) string {
 	return filledTemplate
 }
 
+func getPRTitleForRepository(repoName string) string {
+	// Check for known repositories with specific title requirements
+	if strings.Contains(repoName, "ossf/") || strings.Contains(repoName, "kubernetes") || strings.Contains(repoName, "k8s.io") {
+		// These repositories often use emoji prefixes for PR categorization
+		return ":seedling: security: pin GitHub Actions to commit hashes"
+	}
+	
+	// Default title for most repositories - use conventional commit format
+	return "security: pin GitHub Actions to commit hashes"
+}
+
+func getPRSearchPattern(repoName string) string {
+	// Return the appropriate search pattern based on repository
+	if strings.Contains(repoName, "ossf/") || strings.Contains(repoName, "kubernetes") || strings.Contains(repoName, "k8s.io") {
+		return ":seedling: security: pin GitHub Actions to commit hashes in:title"
+	}
+	
+	return "security: pin GitHub Actions to commit hashes in:title"
+}
+
+// ...existing code...
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
