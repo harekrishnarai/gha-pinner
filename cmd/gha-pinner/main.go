@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ import (
 var (
 	debug                = false
 	ignorePRTemplates    = false
+	skipPRCreation       = false
+	outputDir            = ""
 	errUnresolvedVersion = errors.New("unresolved version")
 	errNeedsFork         = errors.New("needs fork")
 	skipActions          = []string{}
@@ -77,8 +80,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	debug = len(os.Args) > 3 && os.Args[len(os.Args)-1] == "--debug"
+	debug = len(os.Args) > 3 && contains(os.Args, "--debug")
 	ignorePRTemplates = len(os.Args) > 3 && contains(os.Args, "--ignore-templates")
+	skipPRCreation = len(os.Args) > 3 && contains(os.Args, "--no-pr")
+	
+	// Parse output directory if provided
+	for i, arg := range os.Args {
+		if arg == "--output" && i+1 < len(os.Args) {
+			outputDir = os.Args[i+1]
+			break
+		}
+	}
+	
 	defer cleanup()
 
 	commands := map[string]func(string) error{
@@ -86,6 +99,7 @@ func main() {
 		"repository":       processRepository,
 		"organization":     processOrganization,
 		"switch-account":   switchAccount,
+		"file":             processRepositoryFile,
 	}
 
 	command, target := os.Args[1], os.Args[2]
@@ -117,20 +131,26 @@ func main() {
 
 func showUsage() {
 	fmt.Println("Usage:")
-	fmt.Println("  gha-pinner local-repository <path> [--debug] [--ignore-templates]")
-	fmt.Println("  gha-pinner repository <repo-name> [--debug] [--ignore-templates]")
-	fmt.Println("  gha-pinner organization <org-name> [--debug] [--ignore-templates]")
+	fmt.Println("  gha-pinner local-repository <path> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
+	fmt.Println("  gha-pinner repository <repo-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
+	fmt.Println("  gha-pinner organization <org-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
+	fmt.Println("  gha-pinner file <path-to-repos-file> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
 	fmt.Println("  gha-pinner action <action-name> <version> [--debug]")
 	fmt.Println("  gha-pinner switch-account <username> [--debug]")
 	fmt.Println("")
 	fmt.Println("Options:")
 	fmt.Println("  --debug             Enable debug output")
 	fmt.Println("  --ignore-templates  Ignore PR templates and use full PR body")
+	fmt.Println("  --no-pr             Skip PR creation, only fix repositories locally")
+	fmt.Println("  --output <dir>      Custom output directory for repositories (only with --no-pr)")
 	fmt.Println("")
 	fmt.Println("Examples:")
 	fmt.Println("  gha-pinner local-repository ./my-repo")
 	fmt.Println("  gha-pinner repository owner/repo-name")
 	fmt.Println("  gha-pinner organization my-org")
+	fmt.Println("  gha-pinner file repos.txt")
+	fmt.Println("  gha-pinner file repos.txt --no-pr")
+	fmt.Println("  gha-pinner file repos.txt --no-pr --output ./fixed-repos")
 	fmt.Println("  gha-pinner action actions/checkout v3")
 	fmt.Println("  gha-pinner switch-account harekrishnaraiedbyte")
 }
@@ -155,6 +175,17 @@ func switchAccount(username string) error {
 }
 
 func cleanup() {
+	// If --no-pr is set, don't clean up temp directories to allow manual review
+	if skipPRCreation {
+		fmt.Printf("\n📁 Repositories preserved for manual review:\n")
+		reposDir := getReposDir()
+		if _, err := os.Stat(reposDir); err == nil {
+			fmt.Printf("   • %s\n", reposDir)
+		}
+		fmt.Printf("\n💡 Tip: Review changes and manually commit/push when ready\n")
+		return
+	}
+
 	tempDirs := []string{getTempDir("actions"), getTempDir("repos"), getTempDir("pr-body.md")}
 	for _, dir := range tempDirs {
 		if _, err := os.Stat(dir); err == nil {
@@ -171,6 +202,14 @@ func getTempDir(name string) string {
 		return filepath.Join(os.TempDir(), name)
 	}
 	return filepath.Join("/tmp", name)
+}
+
+func getReposDir() string {
+	if skipPRCreation && outputDir != "" {
+		// Use custom output directory
+		return outputDir
+	}
+	return getTempDir("repos")
 }
 
 func getActionsCacheDir() string {
@@ -228,6 +267,113 @@ func processOrganization(orgName string) error {
 	return nil
 }
 
+func processRepositoryFile(filePath string) error {
+	// Read the file containing repository URLs
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", filePath, err)
+	}
+	defer file.Close()
+
+	var repoURLs []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		repoURLs = append(repoURLs, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed to read file %s: %v", filePath, err)
+	}
+
+	if len(repoURLs) == 0 {
+		return fmt.Errorf("no repository URLs found in file %s", filePath)
+	}
+
+	successCount, errorCount := 0, 0
+	fmt.Printf("📋 Processing %d repositories from file: %s\n", len(repoURLs), filePath)
+
+	for i, repoURL := range repoURLs {
+		// Extract repository name from GitHub URL
+		repoName, err := extractRepoNameFromURL(repoURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error parsing URL %s: %v\n", repoURL, err)
+			errorCount++
+			continue
+		}
+
+		fmt.Printf("\n[%d/%d] 🔍 Processing repository: %s\n", i+1, len(repoURLs), repoName)
+		
+		// Get repository metadata
+		result := execCommand("gh", "repo", "view", repoName, "--json", "name,url,defaultBranchRef")
+		if result.ExitCode != 0 {
+			fmt.Fprintf(os.Stderr, "❌ Error fetching metadata for %s: %s\n", repoName, result.Stderr)
+			errorCount++
+			continue
+		}
+
+		var repo Repository
+		if err := json.Unmarshal([]byte(result.Stdout), &repo); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error parsing metadata for %s: %v\n", repoName, err)
+			errorCount++
+			continue
+		}
+		repo.URL = repoName // Store the full repo name for cloning
+
+		if err := patchRepository(repo); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error processing %s: %v\n", repoName, err)
+			errorCount++
+		} else {
+			successCount++
+		}
+	}
+
+	fmt.Printf("\n🎯 File processing complete:\n")
+	fmt.Printf("   • ✅ Successful: %d repositories\n", successCount)
+	fmt.Printf("   • ❌ Failed: %d repositories\n", errorCount)
+	fmt.Printf("   • 📊 Total: %d repositories\n", len(repoURLs))
+	return nil
+}
+
+func extractRepoNameFromURL(repoURL string) (string, error) {
+	// Handle different GitHub URL formats:
+	// https://github.com/owner/repo
+	// https://github.com/owner/repo.git
+	// git@github.com:owner/repo.git
+	// owner/repo
+
+	// If it's already in owner/repo format, return as-is
+	if !strings.Contains(repoURL, "github.com") && strings.Count(repoURL, "/") == 1 {
+		return repoURL, nil
+	}
+
+	// Extract from GitHub URLs
+	repoURL = strings.TrimSpace(repoURL)
+	
+	// Remove .git suffix if present
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	
+	if strings.HasPrefix(repoURL, "https://github.com/") {
+		// https://github.com/owner/repo
+		parts := strings.Split(strings.TrimPrefix(repoURL, "https://github.com/"), "/")
+		if len(parts) >= 2 {
+			return fmt.Sprintf("%s/%s", parts[0], parts[1]), nil
+		}
+	} else if strings.HasPrefix(repoURL, "git@github.com:") {
+		// git@github.com:owner/repo
+		parts := strings.Split(strings.TrimPrefix(repoURL, "git@github.com:"), "/")
+		if len(parts) >= 2 {
+			return fmt.Sprintf("%s/%s", parts[0], parts[1]), nil
+		}
+	}
+
+	return "", fmt.Errorf("invalid GitHub repository URL format: %s", repoURL)
+}
+
 func resolveVersion(action, version string) error {
 	hash, resolvedVersion, err := getCommitHashFromVersion(action, version)
 	if err != nil {
@@ -251,13 +397,21 @@ func patchRepository(repo Repository) error {
 
 	if err := checkRepositoryPermissions(cloneTarget); err != nil {
 		if errors.Is(err, errNeedsFork) {
-			// Fork the repository
+			// Fork the repository and sync it
 			forkName, forkErr := forkRepository(cloneTarget)
 			if forkErr != nil {
 				return fmt.Errorf("failed to fork repository: %v", forkErr)
 			}
 			cloneTarget = forkName
 			needsFork = true
+			
+			// Sync fork with upstream if it exists
+			if syncErr := syncForkWithUpstream(forkName, originalRepo); syncErr != nil {
+				if debug {
+					fmt.Printf("Warning: failed to sync fork %s with upstream: %v\n", forkName, syncErr)
+				}
+			}
+			
 			if debug {
 				fmt.Printf("Using fork: %s\n", cloneTarget)
 			}
@@ -266,9 +420,12 @@ func patchRepository(repo Repository) error {
 		}
 	}
 
-	repoDir := filepath.Join(getTempDir("repos"), strings.ReplaceAll(repo.Name, "/", "_"))
+	repoDir := filepath.Join(getReposDir(), strings.ReplaceAll(repo.Name, "/", "_"))
 
 	if _, err := os.Stat(repoDir); err == nil {
+		if debug {
+			fmt.Printf("Repository directory already exists, removing: %s\n", repoDir)
+		}
 		if err := os.RemoveAll(repoDir); err != nil {
 			return fmt.Errorf("failed to remove existing directory: %v", err)
 		}
@@ -278,7 +435,7 @@ func patchRepository(repo Repository) error {
 		return fmt.Errorf("failed to clone repository: %s", result.Stderr)
 	}
 
-	// If we forked, add the original as upstream
+	// If we forked and synced, ensure we have the latest changes locally
 	if needsFork {
 		if debug {
 			fmt.Printf("Adding upstream remote: %s\n", originalRepo)
@@ -286,8 +443,31 @@ func patchRepository(repo Repository) error {
 		result := execCommandWithDir(repoDir, "git", "remote", "add", "upstream", fmt.Sprintf("https://github.com/%s.git", originalRepo))
 		if result.ExitCode != 0 {
 			if debug {
-				fmt.Printf("Warning: failed to add upstream remote: %s\n", result.Stderr)
+				fmt.Printf("Warning: failed to add upstream remote (may already exist): %s\n", result.Stderr)
 			}
+		}
+
+		// Fetch the latest changes from origin (our fork) to ensure we have the synced code
+		if debug {
+			fmt.Printf("Fetching latest changes from fork...\n")
+		}
+		result = execCommandWithDir(repoDir, "git", "fetch", "origin", "--quiet")
+		if result.ExitCode != 0 && debug {
+			fmt.Printf("Warning: failed to fetch from origin: %s\n", result.Stderr)
+		}
+
+		// Reset to the latest origin/main to ensure we're working with synced code
+		defaultBranch := repo.DefaultBranchRef.Name
+		if defaultBranch == "" {
+			defaultBranch = "main"
+		}
+		
+		if debug {
+			fmt.Printf("Resetting to latest %s from fork...\n", defaultBranch)
+		}
+		result = execCommandWithDir(repoDir, "git", "reset", "--hard", fmt.Sprintf("origin/%s", defaultBranch))
+		if result.ExitCode != 0 && debug {
+			fmt.Printf("Warning: failed to reset to origin/%s: %s\n", defaultBranch, result.Stderr)
 		}
 	}
 
@@ -301,6 +481,23 @@ func patchRepository(repo Repository) error {
 
 	if result := execCommandWithDir(repoDir, "git", "diff", "--exit-code"); result.ExitCode == 0 {
 		fmt.Printf("✅ No changes needed for repository: %s - all actions are already properly secured\n", repo.Name)
+		return nil
+	}
+
+	// If --no-pr flag is set, just show the changes and exit
+	if skipPRCreation {
+		fmt.Printf("🔍 Changes detected in repository: %s\n", repo.Name)
+		
+		// Show the diff for review
+		diffResult := execCommandWithDir(repoDir, "git", "diff", ".github/workflows")
+		if diffResult.ExitCode == 0 && diffResult.Stdout != "" {
+			fmt.Printf("\n📋 Workflow changes preview:\n")
+			fmt.Printf("---\n%s---\n", diffResult.Stdout)
+		}
+		
+		fmt.Printf("✅ Repository %s has been processed and changes are ready for review\n", repo.Name)
+		fmt.Printf("   • Repository location: %s\n", repoDir)
+		fmt.Printf("   • To create a PR manually: cd %s && git add . && git commit -m 'Pin GitHub Actions' && git push\n", repoDir)
 		return nil
 	}
 
@@ -327,12 +524,13 @@ func patchRepository(repo Repository) error {
 		fmt.Printf("Successfully pushed branch: %s\n", branchName)
 	}
 
-	// Check for existing PRs in the original repository (not the fork)
+	// Check for existing PRs in both the original repository and the fork
 	searchRepo := originalRepo
 	if !needsFork {
 		searchRepo = cloneTarget
 	}
 
+	// First check for existing PRs in the target repository
 	result := execCommand("gh", "pr", "list", "--repo", searchRepo, "--search", getPRSearchPattern(searchRepo), "--state", "open", "--json", "title,url")
 	if debug {
 		fmt.Printf("PR search in %s: exit=%d, output=%s\n", searchRepo, result.ExitCode, result.Stdout)
@@ -341,6 +539,35 @@ func patchRepository(repo Repository) error {
 	if result.ExitCode == 0 && strings.TrimSpace(result.Stdout) != "" && strings.TrimSpace(result.Stdout) != "[]" {
 		fmt.Printf("ℹ️  Pull request already exists for repository: %s - skipping PR creation\n", searchRepo)
 		return nil
+	}
+
+	// If we're using a fork, also check for existing PRs from our fork to avoid duplicates
+	if needsFork {
+		// Check for PRs from our fork to the upstream
+		forkPRResult := execCommand("gh", "pr", "list", "--repo", originalRepo, "--author", "@me", "--state", "open", "--json", "title,url,headRefName")
+		if debug {
+			fmt.Printf("Fork PR search in %s by @me: exit=%d, output=%s\n", originalRepo, forkPRResult.ExitCode, forkPRResult.Stdout)
+		}
+
+		if forkPRResult.ExitCode == 0 && strings.TrimSpace(forkPRResult.Stdout) != "" && strings.TrimSpace(forkPRResult.Stdout) != "[]" {
+			// Parse the PR list to check for similar titles
+			var existingPRs []map[string]interface{}
+			if err := json.Unmarshal([]byte(forkPRResult.Stdout), &existingPRs); err == nil {
+				for _, pr := range existingPRs {
+					if title, ok := pr["title"].(string); ok {
+						if strings.Contains(strings.ToLower(title), "pin") && 
+						   strings.Contains(strings.ToLower(title), "action") &&
+						   strings.Contains(strings.ToLower(title), "security") {
+							fmt.Printf("ℹ️  Similar pull request already exists from fork: %s - skipping PR creation\n", title)
+							if url, ok := pr["url"].(string); ok {
+								fmt.Printf("   • Existing PR: %s\n", url)
+							}
+							return nil
+						}
+					}
+				}
+			}
+		}
 	}
 
 	prTitle := getPRTitleForRepository(searchRepo)
@@ -453,6 +680,94 @@ func forkRepository(repoName string) (string, error) {
 	}
 
 	return forkName, nil
+}
+
+func syncForkWithUpstream(forkName, upstreamName string) error {
+	if debug {
+		fmt.Printf("Checking if fork %s needs to be synced with upstream %s...\n", forkName, upstreamName)
+	}
+
+	// Get the default branch of the upstream repository
+	upstreamResult := execCommand("gh", "repo", "view", upstreamName, "--json", "defaultBranchRef")
+	if upstreamResult.ExitCode != 0 {
+		return fmt.Errorf("failed to get upstream repository info: %s", upstreamResult.Stderr)
+	}
+
+	var upstreamRepo Repository
+	if err := json.Unmarshal([]byte(upstreamResult.Stdout), &upstreamRepo); err != nil {
+		return fmt.Errorf("failed to parse upstream repository info: %v", err)
+	}
+
+	defaultBranch := upstreamRepo.DefaultBranchRef.Name
+	if defaultBranch == "" {
+		defaultBranch = "main" // fallback
+	}
+
+	// Get the latest commit SHA from upstream
+	upstreamCommitResult := execCommand("gh", "api", fmt.Sprintf("repos/%s/commits/%s", upstreamName, defaultBranch))
+	if upstreamCommitResult.ExitCode != 0 {
+		return fmt.Errorf("failed to get upstream commit: %s", upstreamCommitResult.Stderr)
+	}
+
+	var upstreamCommit map[string]interface{}
+	if err := json.Unmarshal([]byte(upstreamCommitResult.Stdout), &upstreamCommit); err != nil {
+		return fmt.Errorf("failed to parse upstream commit: %v", err)
+	}
+
+	upstreamSHA, ok := upstreamCommit["sha"].(string)
+	if !ok {
+		return fmt.Errorf("failed to get upstream commit SHA")
+	}
+
+	// Get the latest commit SHA from fork
+	forkCommitResult := execCommand("gh", "api", fmt.Sprintf("repos/%s/commits/%s", forkName, defaultBranch))
+	if forkCommitResult.ExitCode != 0 {
+		return fmt.Errorf("failed to get fork commit: %s", forkCommitResult.Stderr)
+	}
+
+	var forkCommit map[string]interface{}
+	if err := json.Unmarshal([]byte(forkCommitResult.Stdout), &forkCommit); err != nil {
+		return fmt.Errorf("failed to parse fork commit: %v", err)
+	}
+
+	forkSHA, ok := forkCommit["sha"].(string)
+	if !ok {
+		return fmt.Errorf("failed to get fork commit SHA")
+	}
+
+	// Check if fork is behind upstream
+	if upstreamSHA == forkSHA {
+		if debug {
+			fmt.Printf("Fork %s is up-to-date with upstream %s\n", forkName, upstreamName)
+		}
+		return nil
+	}
+
+	if debug {
+		fmt.Printf("Fork %s is behind upstream %s, syncing...\n", forkName, upstreamName)
+		fmt.Printf("  Fork SHA: %s\n", forkSHA)
+		fmt.Printf("  Upstream SHA: %s\n", upstreamSHA)
+	}
+
+	// Sync the fork using GitHub API
+	syncResult := execCommand("gh", "api", fmt.Sprintf("repos/%s/merge-upstream", forkName), "-X", "POST", "-f", fmt.Sprintf("branch=%s", defaultBranch))
+	if syncResult.ExitCode != 0 {
+		// If sync fails, try the alternative method using gh repo sync
+		if debug {
+			fmt.Printf("API sync failed, trying gh repo sync: %s\n", syncResult.Stderr)
+		}
+		
+		syncResult = execCommand("gh", "repo", "sync", forkName, "--source", upstreamName)
+		if syncResult.ExitCode != 0 {
+			return fmt.Errorf("failed to sync fork with upstream: %s", syncResult.Stderr)
+		}
+	}
+
+	if debug {
+		fmt.Printf("Successfully synced fork %s with upstream %s\n", forkName, upstreamName)
+	}
+
+	return nil
 }
 
 func checkRepositoryPermissions(repoName string) error {
@@ -586,6 +901,14 @@ func patchLocalRepository(repoDir string) error {
 		fmt.Printf("ℹ️  No GitHub Actions found that need pinning (only local actions or already pinned)\n")
 	} else if totalActionsPinned == 0 {
 		fmt.Printf("ℹ️  No GitHub Actions found in workflow files\n")
+	} else if totalActionsPinned > 0 {
+		if skipPRCreation {
+			fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
+			fmt.Printf("   • Repository location: %s\n", repoDir)
+			fmt.Printf("   • Changes are ready for review and manual commit\n")
+		} else {
+			fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
+		}
 	}
 
 	if totalActionsWithLatest > 0 {

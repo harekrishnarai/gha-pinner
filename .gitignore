@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+gha-pinner
 
 # Test binary, built with `go test -c`
 *.test
@@ -95,6 +96,8 @@ secrets.yml
 .env.example.local
 docker-compose.override.yml
 .docker/
+test-repos.txt
+sync-test.txt
 
 # Documentation build artifacts
 docs/_build/
