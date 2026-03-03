@@ -54,7 +54,7 @@ func TestShouldSkipAction(t *testing.T) {
 	}{
 		{"./local-action", true},
 		{"actions/checkout@v3", false},
-		{"actions/checkout@abc123def456789012345678901234567890abcd", true}, // commit hash
+		{"actions/checkout@abc123def456789012345678901234567890abcd", false}, // already pinned is handled elsewhere
 		{"normal/action@v2", false},
 	}
 

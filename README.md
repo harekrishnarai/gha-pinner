@@ -27,8 +27,10 @@ A command-line tool for pinning GitHub Actions to specific commit hashes to impr
 ### Prerequisites
 
 - Go 1.21 or later
-- GitHub CLI (`gh`) installed and authenticated
 - Git installed and configured
+- GitHub authentication via one of:
+  - `gh` CLI (default mode)
+  - Personal Access Token in `GITHUB_TOKEN` or `GH_TOKEN` (PAT mode)
 
 ### Install via go install (Recommended)
 
@@ -55,13 +57,13 @@ go build -o gha-pinner ./cmd/gha-pinner
 gha-pinner local-repository <path> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]
 
 # Pin actions in a remote repository
-gha-pinner repository <repo-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]
+gha-pinner repository <repo-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>] [--auth-mode <gh|pat>] [--repo-workers <n>]
 
 # Pin actions in all repositories of an organization
-gha-pinner organization <org-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]
+gha-pinner organization <org-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>] [--auth-mode <gh|pat>] [--repo-workers <n>]
 
 # Process multiple repositories from a file
-gha-pinner file <path-to-repos-file> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]
+gha-pinner file <path-to-repos-file> [--debug] [--ignore-templates] [--no-pr] [--output <dir>] [--auth-mode <gh|pat>] [--repo-workers <n>]
 
 # Resolve a specific action version to commit hash
 gha-pinner action <action-name> <version> [--debug]
@@ -76,6 +78,8 @@ gha-pinner switch-account <username> [--debug]
 - `--ignore-templates`: Ignore PR templates and use full PR body instead of filling templates
 - `--no-pr`: Skip PR creation, only fix repositories locally for manual review
 - `--output <dir>`: Custom output directory for repositories (only with --no-pr)
+- `--auth-mode <gh|pat>`: Select authentication mode (`gh` default, or PAT without gh CLI)
+- `--repo-workers <n>`: Number of repositories to process in parallel for `organization` and `file` commands (default: 4)
 
 ### Examples
 
@@ -88,6 +92,10 @@ gha-pinner repository owner/repo-name
 
 # Process entire organization
 gha-pinner organization my-org
+
+# Process organization at scale with PAT auth and 12 workers
+export GITHUB_TOKEN=ghp_xxx
+gha-pinner organization my-org --auth-mode pat --repo-workers 12
 
 # Process multiple repositories from a file
 gha-pinner file repos.txt
@@ -248,10 +256,16 @@ Enable `--debug` flag to see detailed timing information:
 ### Environment Variables
 
 - `DEBUG`: Enable debug output (alternative to `--debug` flag)
+- `GITHUB_TOKEN` or `GH_TOKEN`: Required when `--auth-mode pat` is used
 
-### GitHub CLI Requirements
+### Authentication Modes
 
-The tool requires GitHub CLI to be installed and authenticated with proper scopes:
+Use either mode:
+
+- `--auth-mode gh` (default): Requires GitHub CLI authentication
+- `--auth-mode pat`: Uses direct GitHub REST API + git over HTTPS with your token, no gh CLI required
+
+For `gh` mode:
 
 ```bash
 # Install GitHub CLI
@@ -265,6 +279,13 @@ gh auth status
 
 # Switch between accounts if needed
 gha-pinner switch-account username
+```
+
+For PAT mode:
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+gha-pinner organization my-org --auth-mode pat
 ```
 
 **Important**: Make sure your GitHub token has the following scopes:
@@ -431,7 +452,7 @@ The tool includes comprehensive error handling:
 
 ## Limitations
 
-- Requires GitHub CLI for authentication and API access
+- Requires GitHub authentication (`gh` mode or PAT mode)
 - Only processes public repositories or those accessible with current authentication
 - Some semantic versions may not be resolvable to specific commits
 - Rate limiting may apply for large organizations

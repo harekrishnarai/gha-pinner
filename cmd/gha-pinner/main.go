@@ -2,10 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +19,9 @@ import (
 	"time"
 
 	execute "github.com/alexellis/go-execute/v2"
+	"github.com/spf13/cobra"
+	"go.uber.org/multierr"
+	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,6 +30,10 @@ var (
 	ignorePRTemplates    = false
 	skipPRCreation       = false
 	outputDir            = ""
+	authMode             = "gh"
+	githubToken          = ""
+	repoWorkers          = 4
+	logger               = zap.NewNop().Sugar()
 	errUnresolvedVersion = errors.New("unresolved version")
 	errNeedsFork         = errors.New("needs fork")
 	skipActions          = []string{}
@@ -68,94 +79,204 @@ type ExecResult struct {
 }
 
 func main() {
-	startTime := time.Now()
-	defer func() {
-		if debug {
-			fmt.Printf("Total execution time: %v\n", time.Since(startTime))
-		}
-	}()
-
-	if len(os.Args) < 3 {
-		showUsage()
-		os.Exit(1)
-	}
-
-	debug = len(os.Args) > 3 && contains(os.Args, "--debug")
-	ignorePRTemplates = len(os.Args) > 3 && contains(os.Args, "--ignore-templates")
-	skipPRCreation = len(os.Args) > 3 && contains(os.Args, "--no-pr")
-	
-	// Parse output directory if provided
-	for i, arg := range os.Args {
-		if arg == "--output" && i+1 < len(os.Args) {
-			outputDir = os.Args[i+1]
-			break
-		}
-	}
-	
-	defer cleanup()
-
-	commands := map[string]func(string) error{
-		"local-repository": patchLocalRepository,
-		"repository":       processRepository,
-		"organization":     processOrganization,
-		"switch-account":   switchAccount,
-		"file":             processRepositoryFile,
-	}
-
-	command, target := os.Args[1], os.Args[2]
-
-	if command == "action" {
-		if len(os.Args) < 4 {
-			fmt.Fprintf(os.Stderr, "Error: action command requires version parameter\n")
-			showUsage()
-			os.Exit(1)
-		}
-		if err := resolveVersion(target, os.Args[3]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	if fn, exists := commands[command]; exists {
-		if err := fn(target); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		fmt.Fprintf(os.Stderr, "Error: unknown command '%s'\n", command)
-		showUsage()
+	root := newRootCmd()
+	if err := root.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func showUsage() {
-	fmt.Println("Usage:")
-	fmt.Println("  gha-pinner local-repository <path> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
-	fmt.Println("  gha-pinner repository <repo-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
-	fmt.Println("  gha-pinner organization <org-name> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
-	fmt.Println("  gha-pinner file <path-to-repos-file> [--debug] [--ignore-templates] [--no-pr] [--output <dir>]")
-	fmt.Println("  gha-pinner action <action-name> <version> [--debug]")
-	fmt.Println("  gha-pinner switch-account <username> [--debug]")
-	fmt.Println("")
-	fmt.Println("Options:")
-	fmt.Println("  --debug             Enable debug output")
-	fmt.Println("  --ignore-templates  Ignore PR templates and use full PR body")
-	fmt.Println("  --no-pr             Skip PR creation, only fix repositories locally")
-	fmt.Println("  --output <dir>      Custom output directory for repositories (only with --no-pr)")
-	fmt.Println("")
-	fmt.Println("Examples:")
-	fmt.Println("  gha-pinner local-repository ./my-repo")
-	fmt.Println("  gha-pinner repository owner/repo-name")
-	fmt.Println("  gha-pinner organization my-org")
-	fmt.Println("  gha-pinner file repos.txt")
-	fmt.Println("  gha-pinner file repos.txt --no-pr")
-	fmt.Println("  gha-pinner file repos.txt --no-pr --output ./fixed-repos")
-	fmt.Println("  gha-pinner action actions/checkout v3")
-	fmt.Println("  gha-pinner switch-account harekrishnaraiedbyte")
+func newRootCmd() *cobra.Command {
+	rootCmd := &cobra.Command{
+		Use:           "gha-pinner",
+		Short:         "Pin GitHub Actions to commit hashes for stronger supply-chain security",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			applyGlobalFlagsFromCmd(cmd)
+			if err := validateRuntimeConfig(); err != nil {
+				return err
+			}
+			if err := initLogger(); err != nil {
+				return err
+			}
+			logger.Infow("starting command", "command", cmd.Name(), "auth_mode", authMode, "repo_workers", repoWorkers)
+			return nil
+		},
+	}
+
+	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug output")
+	rootCmd.PersistentFlags().BoolVar(&ignorePRTemplates, "ignore-templates", false, "Ignore PR templates and use full PR body")
+	rootCmd.PersistentFlags().BoolVar(&skipPRCreation, "no-pr", false, "Skip PR creation, only fix repositories locally")
+	rootCmd.PersistentFlags().StringVar(&outputDir, "output", "", "Custom output directory for repositories (only with --no-pr)")
+	rootCmd.PersistentFlags().StringVar(&authMode, "auth-mode", "gh", "Authentication mode: gh or pat")
+	rootCmd.PersistentFlags().IntVar(&repoWorkers, "repo-workers", 4, "Number of repositories to process in parallel for organization/file commands")
+
+	rootCmd.AddCommand(
+		&cobra.Command{
+			Use:   "local-repository <path>",
+			Short: "Pin actions in a local repository",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				startTime := time.Now()
+				defer logExecutionTime(startTime)
+				defer runCleanup()
+				return patchLocalRepository(args[0])
+			},
+		},
+		&cobra.Command{
+			Use:   "repository <owner/repo>",
+			Short: "Pin actions in a remote repository",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				startTime := time.Now()
+				defer logExecutionTime(startTime)
+				defer runCleanup()
+				return processRepository(args[0])
+			},
+		},
+		&cobra.Command{
+			Use:   "organization <org>",
+			Short: "Pin actions in repositories across an organization",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				startTime := time.Now()
+				defer logExecutionTime(startTime)
+				defer runCleanup()
+				return processOrganization(args[0])
+			},
+		},
+		&cobra.Command{
+			Use:   "file <path-to-repos-file>",
+			Short: "Pin actions in repositories listed in a file",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				startTime := time.Now()
+				defer logExecutionTime(startTime)
+				defer runCleanup()
+				return processRepositoryFile(args[0])
+			},
+		},
+		&cobra.Command{
+			Use:   "action <action-name> <version>",
+			Short: "Resolve an action version to a commit hash",
+			Args:  cobra.ExactArgs(2),
+			RunE: func(_ *cobra.Command, args []string) error {
+				startTime := time.Now()
+				defer logExecutionTime(startTime)
+				return resolveVersion(args[0], args[1])
+			},
+		},
+		&cobra.Command{
+			Use:   "switch-account <username>",
+			Short: "Switch active GitHub account (gh mode only)",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				startTime := time.Now()
+				defer logExecutionTime(startTime)
+				return switchAccount(args[0])
+			},
+		},
+	)
+
+	return rootCmd
+}
+
+func applyGlobalFlagsFromCmd(cmd *cobra.Command) {
+	flags := cmd.Flags()
+	if flags.Lookup("debug") != nil {
+		if val, err := flags.GetBool("debug"); err == nil {
+			debug = val
+		}
+	}
+	if flags.Lookup("ignore-templates") != nil {
+		if val, err := flags.GetBool("ignore-templates"); err == nil {
+			ignorePRTemplates = val
+		}
+	}
+	if flags.Lookup("no-pr") != nil {
+		if val, err := flags.GetBool("no-pr"); err == nil {
+			skipPRCreation = val
+		}
+	}
+	if flags.Lookup("output") != nil {
+		if val, err := flags.GetString("output"); err == nil {
+			outputDir = val
+		}
+	}
+	if flags.Lookup("auth-mode") != nil {
+		if val, err := flags.GetString("auth-mode"); err == nil {
+			authMode = strings.ToLower(strings.TrimSpace(val))
+		}
+	}
+	if flags.Lookup("repo-workers") != nil {
+		if val, err := flags.GetInt("repo-workers"); err == nil {
+			repoWorkers = val
+		}
+	}
+}
+
+func validateRuntimeConfig() error {
+	if authMode != "gh" && authMode != "pat" {
+		return fmt.Errorf("invalid --auth-mode value %q (allowed: gh, pat)", authMode)
+	}
+
+	if authMode == "pat" {
+		githubToken = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+		if githubToken == "" {
+			githubToken = strings.TrimSpace(os.Getenv("GH_TOKEN"))
+		}
+		if githubToken == "" {
+			return fmt.Errorf("--auth-mode pat requires GITHUB_TOKEN or GH_TOKEN environment variable")
+		}
+	}
+
+	if repoWorkers < 1 {
+		return fmt.Errorf("--repo-workers must be >= 1")
+	}
+
+	return nil
+}
+
+func initLogger() error {
+	if logger != nil {
+		_ = logger.Sync()
+	}
+
+	var l *zap.Logger
+	var err error
+	if debug {
+		l, err = zap.NewDevelopment()
+	} else {
+		l, err = zap.NewProduction()
+	}
+	if err != nil {
+		return fmt.Errorf("failed to initialize logger: %w", err)
+	}
+	logger = l.Sugar()
+	return nil
+}
+
+func logExecutionTime(startTime time.Time) {
+	if debug {
+		logger.Infow("command completed", "elapsed", time.Since(startTime).String())
+		fmt.Printf("Total execution time: %v\n", time.Since(startTime))
+	}
+}
+
+func runCleanup() {
+	if err := cleanup(); err != nil {
+		logger.Warnw("cleanup completed with errors", "error", err)
+		fmt.Fprintf(os.Stderr, "Warning: cleanup encountered errors: %v\n", err)
+	}
 }
 
 func switchAccount(username string) error {
+	if authMode == "pat" {
+		return fmt.Errorf("switch-account is only supported in gh auth mode")
+	}
+	logger.Infow("switching gh account", "username", username)
+
 	// List available accounts
 	result := execCommand("gh", "auth", "status")
 	if result.ExitCode != 0 {
@@ -171,10 +292,11 @@ func switchAccount(username string) error {
 	}
 
 	fmt.Printf("Successfully switched to account: %s\n", username)
+	logger.Infow("switched gh account", "username", username)
 	return nil
 }
 
-func cleanup() {
+func cleanup() error {
 	// If --no-pr is set, don't clean up temp directories to allow manual review
 	if skipPRCreation {
 		fmt.Printf("\n📁 Repositories preserved for manual review:\n")
@@ -183,18 +305,24 @@ func cleanup() {
 			fmt.Printf("   • %s\n", reposDir)
 		}
 		fmt.Printf("\n💡 Tip: Review changes and manually commit/push when ready\n")
-		return
+		return nil
 	}
 
+	var cleanupErr error
 	tempDirs := []string{getTempDir("actions"), getTempDir("repos"), getTempDir("pr-body.md")}
 	for _, dir := range tempDirs {
 		if _, err := os.Stat(dir); err == nil {
-			os.RemoveAll(dir)
+			if err := os.RemoveAll(dir); err != nil {
+				cleanupErr = multierr.Append(cleanupErr, fmt.Errorf("failed to remove %s: %w", dir, err))
+				continue
+			}
 			if debug {
+				logger.Debugw("cleaned temporary path", "path", dir)
 				fmt.Printf("Cleaned up: %s\n", dir)
 			}
 		}
 	}
+	return cleanupErr
 }
 
 func getTempDir(name string) string {
@@ -222,56 +350,43 @@ func getActionsCacheDir() string {
 }
 
 func processRepository(repoName string) error {
-	result := execCommand("gh", "repo", "view", repoName, "--json", "name,url,defaultBranchRef")
-	if result.ExitCode != 0 {
-		return fmt.Errorf("failed to fetch repository metadata: %s", result.Stderr)
-	}
-	var repo Repository
-	if err := json.Unmarshal([]byte(result.Stdout), &repo); err != nil {
-		return fmt.Errorf("failed to parse repository metadata: %v", err)
+	repo, err := getRepositoryMetadata(repoName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch repository metadata: %v", err)
 	}
 	repo.URL = repoName // Store the full repo name for cloning
 	return patchRepository(repo)
 }
 
 func processOrganization(orgName string) error {
-	result := execCommand("gh", "repo", "list", orgName, "--json", "name,url,defaultBranchRef", "--limit", "1000")
-	if result.ExitCode != 0 {
-		return fmt.Errorf("failed to list repositories: %s", result.Stderr)
-	}
-	var repos []Repository
-	if err := json.Unmarshal([]byte(result.Stdout), &repos); err != nil {
-		return fmt.Errorf("failed to parse repositories list: %v", err)
+	logger.Infow("processing organization", "organization", orgName, "workers", repoWorkers)
+	repos, err := listOrganizationRepositories(orgName, 1000)
+	if err != nil {
+		return fmt.Errorf("failed to list repositories: %w", err)
 	}
 
-	successCount, errorCount := 0, 0
 	fmt.Printf("🏢 Processing %d repositories in organization: %s\n", len(repos), orgName)
-
-	for i, repo := range repos {
-		// Ensure we have the full repository name for cloning
+	repoNames := make([]string, 0, len(repos))
+	for _, repo := range repos {
 		fullRepoName := fmt.Sprintf("%s/%s", orgName, repo.Name)
-		repo.URL = fullRepoName
-
-		fmt.Printf("\n[%d/%d] 🔍 Processing repository: %s\n", i+1, len(repos), fullRepoName)
-		if err := patchRepository(repo); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Error processing %s: %v\n", fullRepoName, err)
-			errorCount++
-		} else {
-			successCount++
-		}
+		repoNames = append(repoNames, fullRepoName)
 	}
+	successCount, errorCount := processRepositoryNames(repoNames)
+
 	fmt.Printf("\n🎯 Organization processing complete:\n")
 	fmt.Printf("   • ✅ Successful: %d repositories\n", successCount)
 	fmt.Printf("   • ❌ Failed: %d repositories\n", errorCount)
 	fmt.Printf("   • 📊 Total: %d repositories\n", len(repos))
+	logger.Infow("organization processing complete", "organization", orgName, "successful", successCount, "failed", errorCount, "total", len(repos))
 	return nil
 }
 
 func processRepositoryFile(filePath string) error {
+	logger.Infow("processing repository file", "path", filePath, "workers", repoWorkers)
 	// Read the file containing repository URLs
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open file %s: %v", filePath, err)
+		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
@@ -287,56 +402,99 @@ func processRepositoryFile(filePath string) error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to read file %s: %v", filePath, err)
+		return fmt.Errorf("failed to read file %s: %w", filePath, err)
 	}
 
 	if len(repoURLs) == 0 {
 		return fmt.Errorf("no repository URLs found in file %s", filePath)
 	}
 
-	successCount, errorCount := 0, 0
 	fmt.Printf("📋 Processing %d repositories from file: %s\n", len(repoURLs), filePath)
 
-	for i, repoURL := range repoURLs {
+	normalizedRepoNames := make([]string, 0, len(repoURLs))
+	parseErrors := 0
+	for _, repoURL := range repoURLs {
 		// Extract repository name from GitHub URL
 		repoName, err := extractRepoNameFromURL(repoURL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Error parsing URL %s: %v\n", repoURL, err)
-			errorCount++
+			parseErrors++
 			continue
 		}
-
-		fmt.Printf("\n[%d/%d] 🔍 Processing repository: %s\n", i+1, len(repoURLs), repoName)
-		
-		// Get repository metadata
-		result := execCommand("gh", "repo", "view", repoName, "--json", "name,url,defaultBranchRef")
-		if result.ExitCode != 0 {
-			fmt.Fprintf(os.Stderr, "❌ Error fetching metadata for %s: %s\n", repoName, result.Stderr)
-			errorCount++
-			continue
-		}
-
-		var repo Repository
-		if err := json.Unmarshal([]byte(result.Stdout), &repo); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Error parsing metadata for %s: %v\n", repoName, err)
-			errorCount++
-			continue
-		}
-		repo.URL = repoName // Store the full repo name for cloning
-
-		if err := patchRepository(repo); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Error processing %s: %v\n", repoName, err)
-			errorCount++
-		} else {
-			successCount++
-		}
+		normalizedRepoNames = append(normalizedRepoNames, repoName)
 	}
+
+	successCount, runtimeErrors := processRepositoryNames(normalizedRepoNames)
+	errorCount := parseErrors + runtimeErrors
 
 	fmt.Printf("\n🎯 File processing complete:\n")
 	fmt.Printf("   • ✅ Successful: %d repositories\n", successCount)
 	fmt.Printf("   • ❌ Failed: %d repositories\n", errorCount)
 	fmt.Printf("   • 📊 Total: %d repositories\n", len(repoURLs))
+	logger.Infow("file processing complete", "path", filePath, "successful", successCount, "failed", errorCount, "total", len(repoURLs))
 	return nil
+}
+
+func processRepositoryNames(repoNames []string) (int, int) {
+	if len(repoNames) == 0 {
+		return 0, 0
+	}
+
+	workers := repoWorkers
+	if workers > len(repoNames) {
+		workers = len(repoNames)
+	}
+
+	type repoTask struct {
+		Index int
+		Name  string
+	}
+
+	tasks := make(chan repoTask, len(repoNames))
+	results := make(chan bool, len(repoNames))
+
+	for i, repoName := range repoNames {
+		tasks <- repoTask{Index: i + 1, Name: repoName}
+	}
+	close(tasks)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				fmt.Printf("\n[%d/%d] 🔍 Processing repository: %s\n", task.Index, len(repoNames), task.Name)
+
+				repo, err := getRepositoryMetadata(task.Name)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Error fetching metadata for %s: %v\n", task.Name, err)
+					results <- false
+					continue
+				}
+				repo.URL = task.Name
+				if err := patchRepository(repo); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Error processing %s: %v\n", task.Name, err)
+					results <- false
+					continue
+				}
+				results <- true
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	successCount, errorCount := 0, 0
+	for ok := range results {
+		if ok {
+			successCount++
+		} else {
+			errorCount++
+		}
+	}
+	return successCount, errorCount
 }
 
 func extractRepoNameFromURL(repoURL string) (string, error) {
@@ -353,10 +511,20 @@ func extractRepoNameFromURL(repoURL string) (string, error) {
 
 	// Extract from GitHub URLs
 	repoURL = strings.TrimSpace(repoURL)
-	
+
 	// Remove .git suffix if present
 	repoURL = strings.TrimSuffix(repoURL, ".git")
-	
+
+	if strings.HasPrefix(repoURL, "https://") {
+		if parsed, err := url.Parse(repoURL); err == nil && strings.EqualFold(parsed.Host, "github.com") {
+			trimmedPath := strings.TrimPrefix(parsed.Path, "/")
+			parts := strings.Split(trimmedPath, "/")
+			if len(parts) >= 2 {
+				return fmt.Sprintf("%s/%s", parts[0], parts[1]), nil
+			}
+		}
+	}
+
 	if strings.HasPrefix(repoURL, "https://github.com/") {
 		// https://github.com/owner/repo
 		parts := strings.Split(strings.TrimPrefix(repoURL, "https://github.com/"), "/")
@@ -404,14 +572,14 @@ func patchRepository(repo Repository) error {
 			}
 			cloneTarget = forkName
 			needsFork = true
-			
+
 			// Sync fork with upstream if it exists
 			if syncErr := syncForkWithUpstream(forkName, originalRepo); syncErr != nil {
 				if debug {
 					fmt.Printf("Warning: failed to sync fork %s with upstream: %v\n", forkName, syncErr)
 				}
 			}
-			
+
 			if debug {
 				fmt.Printf("Using fork: %s\n", cloneTarget)
 			}
@@ -431,8 +599,8 @@ func patchRepository(repo Repository) error {
 		}
 	}
 
-	if result := execCommand("gh", "repo", "clone", cloneTarget, repoDir); result.ExitCode != 0 {
-		return fmt.Errorf("failed to clone repository: %s", result.Stderr)
+	if err := cloneRepository(cloneTarget, repoDir, ""); err != nil {
+		return fmt.Errorf("failed to clone repository: %v", err)
 	}
 
 	// If we forked and synced, ensure we have the latest changes locally
@@ -461,7 +629,7 @@ func patchRepository(repo Repository) error {
 		if defaultBranch == "" {
 			defaultBranch = "main"
 		}
-		
+
 		if debug {
 			fmt.Printf("Resetting to latest %s from fork...\n", defaultBranch)
 		}
@@ -487,14 +655,14 @@ func patchRepository(repo Repository) error {
 	// If --no-pr flag is set, just show the changes and exit
 	if skipPRCreation {
 		fmt.Printf("🔍 Changes detected in repository: %s\n", repo.Name)
-		
+
 		// Show the diff for review
 		diffResult := execCommandWithDir(repoDir, "git", "diff", ".github/workflows")
 		if diffResult.ExitCode == 0 && diffResult.Stdout != "" {
 			fmt.Printf("\n📋 Workflow changes preview:\n")
 			fmt.Printf("---\n%s---\n", diffResult.Stdout)
 		}
-		
+
 		fmt.Printf("✅ Repository %s has been processed and changes are ready for review\n", repo.Name)
 		fmt.Printf("   • Repository location: %s\n", repoDir)
 		fmt.Printf("   • To create a PR manually: cd %s && git add . && git commit -m 'Pin GitHub Actions' && git push\n", repoDir)
@@ -531,7 +699,7 @@ func patchRepository(repo Repository) error {
 	}
 
 	// First check for existing PRs in the target repository
-	result := execCommand("gh", "pr", "list", "--repo", searchRepo, "--search", getPRSearchPattern(searchRepo), "--state", "open", "--json", "title,url")
+	result := listOpenPRs(searchRepo, getPRSearchPattern(searchRepo), "")
 	if debug {
 		fmt.Printf("PR search in %s: exit=%d, output=%s\n", searchRepo, result.ExitCode, result.Stdout)
 	}
@@ -544,7 +712,7 @@ func patchRepository(repo Repository) error {
 	// If we're using a fork, also check for existing PRs from our fork to avoid duplicates
 	if needsFork {
 		// Check for PRs from our fork to the upstream
-		forkPRResult := execCommand("gh", "pr", "list", "--repo", originalRepo, "--author", "@me", "--state", "open", "--json", "title,url,headRefName")
+		forkPRResult := listOpenPRs(originalRepo, "", "@me")
 		if debug {
 			fmt.Printf("Fork PR search in %s by @me: exit=%d, output=%s\n", originalRepo, forkPRResult.ExitCode, forkPRResult.Stdout)
 		}
@@ -555,9 +723,9 @@ func patchRepository(repo Repository) error {
 			if err := json.Unmarshal([]byte(forkPRResult.Stdout), &existingPRs); err == nil {
 				for _, pr := range existingPRs {
 					if title, ok := pr["title"].(string); ok {
-						if strings.Contains(strings.ToLower(title), "pin") && 
-						   strings.Contains(strings.ToLower(title), "action") &&
-						   strings.Contains(strings.ToLower(title), "security") {
+						if strings.Contains(strings.ToLower(title), "pin") &&
+							strings.Contains(strings.ToLower(title), "action") &&
+							strings.Contains(strings.ToLower(title), "security") {
 							fmt.Printf("ℹ️  Similar pull request already exists from fork: %s - skipping PR creation\n", title)
 							if url, ok := pr["url"].(string); ok {
 								fmt.Printf("   • Existing PR: %s\n", url)
@@ -583,13 +751,13 @@ func patchRepository(repo Repository) error {
 		if debug {
 			fmt.Printf("Creating cross-repo PR: repo=%s, title=%s, base=%s, head=%s\n", originalRepo, prTitle, repo.DefaultBranchRef.Name, headBranch)
 		}
-		prResult = execCommand("gh", "pr", "create", "--repo", originalRepo, "--title", prTitle, "--body", prBodyContent, "--base", repo.DefaultBranchRef.Name, "--head", headBranch)
+		prResult = createPullRequest(originalRepo, prTitle, prBodyContent, repo.DefaultBranchRef.Name, headBranch, repoDir)
 	} else {
 		// Create normal PR within the same repository
 		if debug {
 			fmt.Printf("Creating PR: title=%s, base=%s, head=%s\n", prTitle, repo.DefaultBranchRef.Name, branchName)
 		}
-		prResult = execCommandWithDir(repoDir, "gh", "pr", "create", "--title", prTitle, "--body", prBodyContent, "--base", repo.DefaultBranchRef.Name, "--head", branchName)
+		prResult = createPullRequest("", prTitle, prBodyContent, repo.DefaultBranchRef.Name, branchName, repoDir)
 	}
 
 	if debug {
@@ -601,11 +769,7 @@ func patchRepository(repo Repository) error {
 			fmt.Printf("Trying alternative PR creation...\n")
 		}
 		// Try alternative method
-		if needsFork {
-			prResult = execCommand("gh", "pr", "create", "--repo", originalRepo, "--title", prTitle, "--body", prBodyContent)
-		} else {
-			prResult = execCommandWithDir(repoDir, "gh", "pr", "create", "--title", prTitle, "--body", prBodyContent)
-		}
+		prResult = createPullRequestFallback(originalRepo, prTitle, prBodyContent, needsFork, repoDir)
 
 		if debug {
 			fmt.Printf("Alternative PR: exit=%d, output=%s\n", prResult.ExitCode, prResult.Stdout)
@@ -639,26 +803,15 @@ func forkRepository(repoName string) (string, error) {
 	}
 
 	// Get current username
-	result := execCommand("gh", "api", "user")
-	if result.ExitCode != 0 {
-		return "", fmt.Errorf("failed to get current user: %s", result.Stderr)
-	}
-
-	var user map[string]interface{}
-	if err := json.Unmarshal([]byte(result.Stdout), &user); err != nil {
-		return "", fmt.Errorf("failed to parse user info: %v", err)
-	}
-
-	username, ok := user["login"].(string)
-	if !ok {
-		return "", fmt.Errorf("failed to get username")
+	username, err := getCurrentUserLogin()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current user: %v", err)
 	}
 
 	forkName := fmt.Sprintf("%s/%s", username, parts[1])
 
 	// Check if fork already exists
-	result = execCommand("gh", "repo", "view", forkName)
-	if result.ExitCode == 0 {
+	if _, err := getRepositoryMetadata(forkName); err == nil {
 		if debug {
 			fmt.Printf("Fork already exists: %s\n", forkName)
 		}
@@ -670,9 +823,8 @@ func forkRepository(repoName string) (string, error) {
 		fmt.Printf("Creating fork of %s...\n", repoName)
 	}
 
-	result = execCommand("gh", "repo", "fork", repoName, "--clone=false")
-	if result.ExitCode != 0 {
-		return "", fmt.Errorf("failed to fork repository: %s", result.Stderr)
+	if err := createFork(repoName); err != nil {
+		return "", fmt.Errorf("failed to fork repository: %v", err)
 	}
 
 	if debug {
@@ -688,14 +840,9 @@ func syncForkWithUpstream(forkName, upstreamName string) error {
 	}
 
 	// Get the default branch of the upstream repository
-	upstreamResult := execCommand("gh", "repo", "view", upstreamName, "--json", "defaultBranchRef")
-	if upstreamResult.ExitCode != 0 {
-		return fmt.Errorf("failed to get upstream repository info: %s", upstreamResult.Stderr)
-	}
-
-	var upstreamRepo Repository
-	if err := json.Unmarshal([]byte(upstreamResult.Stdout), &upstreamRepo); err != nil {
-		return fmt.Errorf("failed to parse upstream repository info: %v", err)
+	upstreamRepo, err := getRepositoryMetadata(upstreamName)
+	if err != nil {
+		return fmt.Errorf("failed to get upstream repository info: %v", err)
 	}
 
 	defaultBranch := upstreamRepo.DefaultBranchRef.Name
@@ -704,7 +851,7 @@ func syncForkWithUpstream(forkName, upstreamName string) error {
 	}
 
 	// Get the latest commit SHA from upstream
-	upstreamCommitResult := execCommand("gh", "api", fmt.Sprintf("repos/%s/commits/%s", upstreamName, defaultBranch))
+	upstreamCommitResult := githubAPI("GET", fmt.Sprintf("repos/%s/commits/%s", upstreamName, defaultBranch), nil)
 	if upstreamCommitResult.ExitCode != 0 {
 		return fmt.Errorf("failed to get upstream commit: %s", upstreamCommitResult.Stderr)
 	}
@@ -720,7 +867,7 @@ func syncForkWithUpstream(forkName, upstreamName string) error {
 	}
 
 	// Get the latest commit SHA from fork
-	forkCommitResult := execCommand("gh", "api", fmt.Sprintf("repos/%s/commits/%s", forkName, defaultBranch))
+	forkCommitResult := githubAPI("GET", fmt.Sprintf("repos/%s/commits/%s", forkName, defaultBranch), nil)
 	if forkCommitResult.ExitCode != 0 {
 		return fmt.Errorf("failed to get fork commit: %s", forkCommitResult.Stderr)
 	}
@@ -750,17 +897,11 @@ func syncForkWithUpstream(forkName, upstreamName string) error {
 	}
 
 	// Sync the fork using GitHub API
-	syncResult := execCommand("gh", "api", fmt.Sprintf("repos/%s/merge-upstream", forkName), "-X", "POST", "-f", fmt.Sprintf("branch=%s", defaultBranch))
+	syncResult := githubAPI("POST", fmt.Sprintf("repos/%s/merge-upstream", forkName), map[string]interface{}{
+		"branch": defaultBranch,
+	})
 	if syncResult.ExitCode != 0 {
-		// If sync fails, try the alternative method using gh repo sync
-		if debug {
-			fmt.Printf("API sync failed, trying gh repo sync: %s\n", syncResult.Stderr)
-		}
-		
-		syncResult = execCommand("gh", "repo", "sync", forkName, "--source", upstreamName)
-		if syncResult.ExitCode != 0 {
-			return fmt.Errorf("failed to sync fork with upstream: %s", syncResult.Stderr)
-		}
+		return fmt.Errorf("failed to sync fork with upstream: %s", syncResult.Stderr)
 	}
 
 	if debug {
@@ -772,7 +913,7 @@ func syncForkWithUpstream(forkName, upstreamName string) error {
 
 func checkRepositoryPermissions(repoName string) error {
 	// Check if the current user has write access to the repository
-	result := execCommand("gh", "api", fmt.Sprintf("repos/%s", repoName))
+	result := githubAPI("GET", fmt.Sprintf("repos/%s", repoName), nil)
 	if result.ExitCode != 0 {
 		return fmt.Errorf("failed to check repository permissions: %s", result.Stderr)
 	}
@@ -804,6 +945,16 @@ func checkRepositoryPermissions(repoName string) error {
 }
 
 func configureGitCredentials(repoDir string) error {
+	if authMode == "pat" {
+		username, err := getCurrentUserLogin()
+		if err != nil {
+			username = "gha-pinner"
+		}
+		execCommandWithDir(repoDir, "git", "config", "user.name", username)
+		execCommandWithDir(repoDir, "git", "config", "user.email", username+"@users.noreply.github.com")
+		return nil
+	}
+
 	execCommandWithDir(repoDir, "git", "config", "--unset", "credential.helper")
 	if result := execCommandWithDir(repoDir, "git", "config", "credential.helper", "!gh auth git-credential"); result.ExitCode != 0 {
 		return fmt.Errorf("failed to configure git credentials: %s", result.Stderr)
@@ -1129,21 +1280,18 @@ func getCommitHashFromVersion(action, version string) (string, string, error) {
 			fmt.Printf("Cloning action repository: %s (this may take a moment for large repos)\n", repoName)
 		}
 		// Use very shallow clone for fastest cloning - we only need recent history
-		result := execCommand("gh", "repo", "clone", repoName, actionDir, "--", "--depth=1")
-		if result.ExitCode != 0 {
+		if err := cloneRepository(repoName, actionDir, "--depth=1"); err != nil {
 			// Fallback to deeper clone if very shallow clone fails
 			if debug {
 				fmt.Printf("Very shallow clone failed, trying deeper clone for %s\n", repoName)
 			}
-			result = execCommand("gh", "repo", "clone", repoName, actionDir, "--", "--depth=10")
-			if result.ExitCode != 0 {
+			if err = cloneRepository(repoName, actionDir, "--depth=10"); err != nil {
 				// Final fallback to full clone
 				if debug {
 					fmt.Printf("Shallow clone failed, trying full clone for %s\n", repoName)
 				}
-				result = execCommand("gh", "repo", "clone", repoName, actionDir)
-				if result.ExitCode != 0 {
-					return "", "", fmt.Errorf("failed to clone action repository: %s", result.Stderr)
+				if err = cloneRepository(repoName, actionDir, ""); err != nil {
+					return "", "", fmt.Errorf("failed to clone action repository: %v", err)
 				}
 			}
 		}
@@ -1201,7 +1349,7 @@ func getCommitHashViaAPI(action, version string) (string, string, error) {
 	}
 
 	// Try to get commit hash from GitHub API for tags/branches
-	result := execCommand("gh", "api", fmt.Sprintf("repos/%s/git/refs/tags/%s", repoName, version))
+	result := githubAPI("GET", fmt.Sprintf("repos/%s/git/refs/tags/%s", repoName, version), nil)
 	if result.ExitCode == 0 {
 		var tagRef map[string]interface{}
 		if err := json.Unmarshal([]byte(result.Stdout), &tagRef); err == nil {
@@ -1214,7 +1362,7 @@ func getCommitHashViaAPI(action, version string) (string, string, error) {
 	}
 
 	// Try as a branch
-	result = execCommand("gh", "api", fmt.Sprintf("repos/%s/git/refs/heads/%s", repoName, version))
+	result = githubAPI("GET", fmt.Sprintf("repos/%s/git/refs/heads/%s", repoName, version), nil)
 	if result.ExitCode == 0 {
 		var branchRef map[string]interface{}
 		if err := json.Unmarshal([]byte(result.Stdout), &branchRef); err == nil {
@@ -1227,6 +1375,325 @@ func getCommitHashViaAPI(action, version string) (string, string, error) {
 	}
 
 	return "", "", fmt.Errorf("could not resolve via API")
+}
+
+func getRepositoryMetadata(repoName string) (Repository, error) {
+	if authMode == "gh" {
+		result := execCommand("gh", "repo", "view", repoName, "--json", "name,url,defaultBranchRef")
+		if result.ExitCode != 0 {
+			return Repository{}, fmt.Errorf("%s", result.Stderr)
+		}
+		var repo Repository
+		if err := json.Unmarshal([]byte(result.Stdout), &repo); err != nil {
+			return Repository{}, fmt.Errorf("failed to parse repository metadata: %v", err)
+		}
+		return repo, nil
+	}
+
+	result := githubAPI("GET", fmt.Sprintf("repos/%s", repoName), nil)
+	if result.ExitCode != 0 {
+		return Repository{}, fmt.Errorf("%s", result.Stderr)
+	}
+	var repoAPI struct {
+		Name          string `json:"name"`
+		HTMLURL       string `json:"html_url"`
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &repoAPI); err != nil {
+		return Repository{}, fmt.Errorf("failed to parse repository metadata: %v", err)
+	}
+	return Repository{
+		Name: repoAPI.Name,
+		URL:  repoAPI.HTMLURL,
+		DefaultBranchRef: DefaultBranchRef{
+			Name: repoAPI.DefaultBranch,
+		},
+	}, nil
+}
+
+func listOrganizationRepositories(orgName string, limit int) ([]Repository, error) {
+	if authMode == "gh" {
+		result := execCommand("gh", "repo", "list", orgName, "--json", "name,url,defaultBranchRef", "--limit", fmt.Sprintf("%d", limit))
+		if result.ExitCode != 0 {
+			return nil, fmt.Errorf("%s", result.Stderr)
+		}
+		var repos []Repository
+		if err := json.Unmarshal([]byte(result.Stdout), &repos); err != nil {
+			return nil, fmt.Errorf("failed to parse repositories list: %v", err)
+		}
+		return repos, nil
+	}
+
+	repos := []Repository{}
+	perPage := 100
+	page := 1
+	for len(repos) < limit {
+		endpoint := fmt.Sprintf("orgs/%s/repos?per_page=%d&page=%d&type=all", orgName, perPage, page)
+		result := githubAPI("GET", endpoint, nil)
+		if result.ExitCode != 0 {
+			return nil, fmt.Errorf("%s", result.Stderr)
+		}
+		var items []map[string]interface{}
+		if err := json.Unmarshal([]byte(result.Stdout), &items); err != nil {
+			return nil, fmt.Errorf("failed to parse repositories list: %v", err)
+		}
+		if len(items) == 0 {
+			break
+		}
+		for _, item := range items {
+			name, _ := item["name"].(string)
+			defaultBranch, _ := item["default_branch"].(string)
+			repos = append(repos, Repository{
+				Name: name,
+				DefaultBranchRef: DefaultBranchRef{
+					Name: defaultBranch,
+				},
+			})
+			if len(repos) >= limit {
+				break
+			}
+		}
+		page++
+	}
+	return repos, nil
+}
+
+func cloneRepository(repoName, dir, depthArg string) error {
+	if authMode == "gh" {
+		args := []string{"repo", "clone", repoName, dir}
+		if depthArg != "" {
+			args = append(args, "--", depthArg)
+		}
+		result := execCommand("gh", args...)
+		if result.ExitCode != 0 {
+			return fmt.Errorf("%s", result.Stderr)
+		}
+		return nil
+	}
+
+	cloneURL, err := getAuthenticatedCloneURL(repoName)
+	if err != nil {
+		return err
+	}
+	args := []string{"clone", cloneURL, dir}
+	if depthArg != "" {
+		args = append(args, depthArg)
+	}
+	result := execCommand("git", args...)
+	if result.ExitCode != 0 {
+		return fmt.Errorf("%s", result.Stderr)
+	}
+	return nil
+}
+
+func listOpenPRs(repo, search, author string) ExecResult {
+	if authMode == "gh" {
+		args := []string{"pr", "list", "--repo", repo, "--state", "open", "--json", "title,url,headRefName"}
+		if search != "" {
+			args = append(args, "--search", search)
+		}
+		if author != "" {
+			args = append(args, "--author", author)
+		}
+		return execCommand("gh", args...)
+	}
+
+	query := url.Values{}
+	query.Set("state", "open")
+	query.Set("per_page", "100")
+	endpoint := fmt.Sprintf("repos/%s/pulls?%s", repo, query.Encode())
+	result := githubAPI("GET", endpoint, nil)
+	if result.ExitCode != 0 {
+		return result
+	}
+
+	var pulls []map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Stdout), &pulls); err != nil {
+		return ExecResult{ExitCode: 1, Stderr: fmt.Sprintf("failed to parse pull requests: %v", err)}
+	}
+
+	filtered := make([]map[string]interface{}, 0, len(pulls))
+	searchNeedle := strings.ToLower(strings.ReplaceAll(search, " in:title", ""))
+	for _, pr := range pulls {
+		title, _ := pr["title"].(string)
+		if searchNeedle != "" && !strings.Contains(strings.ToLower(title), searchNeedle) {
+			continue
+		}
+		if author != "" {
+			user, _ := pr["user"].(map[string]interface{})
+			login, _ := user["login"].(string)
+			if author == "@me" {
+				me, err := getCurrentUserLogin()
+				if err != nil || !strings.EqualFold(login, me) {
+					continue
+				}
+			} else if !strings.EqualFold(login, author) {
+				continue
+			}
+		}
+		headRef := ""
+		if headObj, ok := pr["head"].(map[string]interface{}); ok {
+			headRef, _ = headObj["ref"].(string)
+		}
+		filtered = append(filtered, map[string]interface{}{
+			"title":       title,
+			"url":         pr["html_url"],
+			"headRefName": headRef,
+		})
+	}
+
+	data, err := json.Marshal(filtered)
+	if err != nil {
+		return ExecResult{ExitCode: 1, Stderr: fmt.Sprintf("failed to encode pull requests: %v", err)}
+	}
+	return ExecResult{ExitCode: 0, Stdout: string(data)}
+}
+
+func createPullRequest(repo, title, body, base, head, repoDir string) ExecResult {
+	if authMode == "gh" {
+		args := []string{"pr", "create", "--title", title, "--body", body, "--base", base, "--head", head}
+		if repo != "" {
+			args = []string{"pr", "create", "--repo", repo, "--title", title, "--body", body, "--base", base, "--head", head}
+			return execCommand("gh", args...)
+		}
+		return execCommandWithDir(repoDir, "gh", args...)
+	}
+
+	targetRepo := repo
+	if targetRepo == "" {
+		origin := strings.TrimSpace(execCommandWithDir(repoDir, "git", "remote", "get-url", "origin").Stdout)
+		parsed, err := extractRepoNameFromURL(origin)
+		if err != nil {
+			return ExecResult{ExitCode: 1, Stderr: fmt.Sprintf("failed to derive repo from origin: %v", err)}
+		}
+		targetRepo = parsed
+	}
+
+	payload := map[string]interface{}{
+		"title": title,
+		"body":  body,
+		"base":  base,
+		"head":  head,
+	}
+	result := githubAPI("POST", fmt.Sprintf("repos/%s/pulls", targetRepo), payload)
+	if result.ExitCode != 0 {
+		return result
+	}
+
+	var created map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Stdout), &created); err != nil {
+		return ExecResult{ExitCode: 1, Stderr: fmt.Sprintf("failed to parse created pull request: %v", err)}
+	}
+	urlStr, _ := created["html_url"].(string)
+	return ExecResult{ExitCode: 0, Stdout: urlStr}
+}
+
+func createPullRequestFallback(originalRepo, title, body string, needsFork bool, repoDir string) ExecResult {
+	if authMode == "gh" {
+		if needsFork {
+			return execCommand("gh", "pr", "create", "--repo", originalRepo, "--title", title, "--body", body)
+		}
+		return execCommandWithDir(repoDir, "gh", "pr", "create", "--title", title, "--body", body)
+	}
+	return ExecResult{ExitCode: 1, Stderr: "failed to create pull request with provided base/head configuration"}
+}
+
+func createFork(repoName string) error {
+	if authMode == "gh" {
+		result := execCommand("gh", "repo", "fork", repoName, "--clone=false")
+		if result.ExitCode != 0 {
+			return fmt.Errorf("%s", result.Stderr)
+		}
+		return nil
+	}
+	result := githubAPI("POST", fmt.Sprintf("repos/%s/forks", repoName), map[string]interface{}{})
+	if result.ExitCode != 0 {
+		return fmt.Errorf("%s", result.Stderr)
+	}
+	return nil
+}
+
+func getCurrentUserLogin() (string, error) {
+	result := githubAPI("GET", "user", nil)
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("%s", result.Stderr)
+	}
+	var user map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Stdout), &user); err != nil {
+		return "", fmt.Errorf("failed to parse user info: %v", err)
+	}
+	username, ok := user["login"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("failed to get username")
+	}
+	return username, nil
+}
+
+func githubAPI(method, endpoint string, payload map[string]interface{}) ExecResult {
+	if authMode == "gh" {
+		args := []string{"api", endpoint}
+		if method != "GET" {
+			args = append(args, "-X", method)
+		}
+		for k, v := range payload {
+			args = append(args, "-f", fmt.Sprintf("%s=%v", k, v))
+		}
+		return execCommand("gh", args...)
+	}
+
+	body := io.Reader(nil)
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return ExecResult{ExitCode: 1, Stderr: fmt.Sprintf("failed to encode API payload: %v", err)}
+		}
+		body = bytes.NewReader(raw)
+	}
+
+	endpoint = strings.TrimPrefix(endpoint, "/")
+	req, err := http.NewRequest(method, "https://api.github.com/"+endpoint, body)
+	if err != nil {
+		return ExecResult{ExitCode: 1, Stderr: err.Error()}
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+githubToken)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ExecResult{ExitCode: 1, Stderr: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ExecResult{ExitCode: 1, Stderr: err.Error()}
+	}
+
+	if resp.StatusCode >= 300 {
+		return ExecResult{ExitCode: 1, Stderr: fmt.Sprintf("github api %s %s failed: %s", method, endpoint, strings.TrimSpace(string(respBody)))}
+	}
+	return ExecResult{ExitCode: 0, Stdout: string(respBody)}
+}
+
+func getAuthenticatedCloneURL(repoName string) (string, error) {
+	if authMode == "gh" {
+		return "", fmt.Errorf("authenticated clone URL only applies in pat mode")
+	}
+	if githubToken == "" {
+		return "", fmt.Errorf("missing GitHub token")
+	}
+	u := &url.URL{
+		Scheme: "https",
+		Host:   "github.com",
+		Path:   "/" + strings.TrimPrefix(repoName, "/") + ".git",
+	}
+	u.User = url.UserPassword("x-access-token", githubToken)
+	return u.String(), nil
 }
 
 func execCommand(name string, args ...string) ExecResult {
@@ -1244,14 +1711,24 @@ func execCommandWithDir(dir, name string, args ...string) ExecResult {
 		}
 	}
 
-	if debug && (result.ExitCode != 0 || result.Stderr != "") {
-		fmt.Printf("Command: %s %s\n", name, strings.Join(args, " "))
-		if dir != "" {
-			fmt.Printf("Directory: %s\n", dir)
-		}
-		fmt.Printf("Exit Code: %d\n", result.ExitCode)
-		if result.Stderr != "" {
-			fmt.Printf("Stderr: %s\n", result.Stderr)
+	if debug {
+		logger.Debugw(
+			"command executed",
+			"command", name,
+			"args", strings.Join(args, " "),
+			"cwd", dir,
+			"exit_code", result.ExitCode,
+			"stderr", result.Stderr,
+		)
+		if result.ExitCode != 0 || result.Stderr != "" {
+			fmt.Printf("Command: %s %s\n", name, strings.Join(args, " "))
+			if dir != "" {
+				fmt.Printf("Directory: %s\n", dir)
+			}
+			fmt.Printf("Exit Code: %d\n", result.ExitCode)
+			if result.Stderr != "" {
+				fmt.Printf("Stderr: %s\n", result.Stderr)
+			}
 		}
 	}
 
@@ -1422,7 +1899,7 @@ func getPRTitleForRepository(repoName string) string {
 		// These repositories often use emoji prefixes for PR categorization
 		return ":seedling: security: pin GitHub Actions to commit hashes"
 	}
-	
+
 	// Default title for most repositories - use conventional commit format
 	return "security: pin GitHub Actions to commit hashes"
 }
@@ -1432,7 +1909,7 @@ func getPRSearchPattern(repoName string) string {
 	if strings.Contains(repoName, "ossf/") || strings.Contains(repoName, "kubernetes") || strings.Contains(repoName, "k8s.io") {
 		return ":seedling: security: pin GitHub Actions to commit hashes in:title"
 	}
-	
+
 	return "security: pin GitHub Actions to commit hashes in:title"
 }
 
