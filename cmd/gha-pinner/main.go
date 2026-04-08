@@ -1186,8 +1186,11 @@ func (p *WorkflowPatcher) patchFile(filePath string) (patchResult, error) {
 	if err != nil {
 		return patchResult{}, fmt.Errorf("failed to read file: %v", err)
 	}
-	// Normalize Windows line endings so all passes can do simple string comparisons.
-	originalContent := strings.ReplaceAll(string(content), "\r\n", "\n")
+	raw := string(content)
+	// Remember whether the file uses Windows line endings so we can restore them
+	// on write. All internal processing uses LF-only strings.
+	hasCRLF := strings.Contains(raw, "\r\n")
+	originalContent := strings.ReplaceAll(raw, "\r\n", "\n")
 
 	var workflow map[string]interface{}
 	if err := yaml.Unmarshal(content, &workflow); err != nil {
@@ -1223,7 +1226,11 @@ func (p *WorkflowPatcher) patchFile(filePath string) (patchResult, error) {
 	}
 
 	if current != originalContent {
-		if err := os.WriteFile(filePath, []byte(current), 0644); err != nil {
+		out := current
+		if hasCRLF {
+			out = strings.ReplaceAll(current, "\n", "\r\n")
+		}
+		if err := os.WriteFile(filePath, []byte(out), 0644); err != nil {
 			return patchResult{}, fmt.Errorf("failed to write updated file: %v", err)
 		}
 	}
