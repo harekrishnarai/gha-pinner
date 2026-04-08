@@ -1170,9 +1170,7 @@ func (p *WorkflowPatcher) patchFile(filePath string) (patchResult, error) {
 	if p.injectHardenRunner && !isComposite {
 		updated, count, injErr := p.injectHardenRunnerPass(current, workflow)
 		if injErr != nil {
-			if debug {
-				fmt.Printf("Warning: harden-runner injection failed for %s: %v\n", filePath, injErr)
-			}
+			fmt.Printf("⚠️  Warning: harden-runner injection failed for %s: %v\n", filePath, injErr)
 		} else {
 			current = updated
 			res.hardenInjected = count
@@ -1313,153 +1311,6 @@ func pinActionsPass(content string, workflow map[string]interface{}, isComposite
 	return updated, res, nil
 }
 
-func processWorkflowFile(filePath string) (int, int, int, int, int, int, error) {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to read file: %v", err)
-	}
-
-	originalContent := string(content)
-	var workflow map[string]interface{}
-	if err := yaml.Unmarshal(content, &workflow); err != nil {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to parse YAML: %v", err)
-	}
-
-	jobs, ok := workflow["jobs"].(map[string]interface{})
-	if !ok {
-		return 0, 0, 0, 0, 0, 0, nil
-	}
-
-	// Collect all actions that need to be pinned
-	var actionsToPin []actionPin
-	var actionsAlreadyPinned int
-	var actionsSkipped int
-	var actionsWithLatest int
-	var actionsWithoutTags int
-	var totalActions int
-
-	for _, jobData := range jobs {
-		if job, ok := jobData.(map[string]interface{}); ok {
-			if steps, ok := job["steps"].([]interface{}); ok {
-				for _, stepData := range steps {
-					if step, ok := stepData.(map[string]interface{}); ok {
-						if uses, ok := step["uses"].(string); ok && uses != "" {
-							totalActions++
-
-							if shouldSkipAction(uses) {
-								actionsSkipped++
-								continue
-							}
-
-							// Check if already pinned (has commit hash)
-							if matched, _ := regexp.MatchString(`@[a-f0-9]{40}`, uses); matched {
-								actionsAlreadyPinned++
-								continue
-							}
-
-							// Check for @latest tag
-							if strings.Contains(uses, "@latest") {
-								actionsWithLatest++
-							}
-
-							if action, version, err := parseActionReference(uses); err == nil {
-								actionsToPin = append(actionsToPin, actionPin{action: action, version: version})
-							} else if strings.Contains(err.Error(), "action without tag/ref") {
-								// Action without tag/ref - this is insecure
-								actionsWithoutTags++
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	if len(actionsToPin) == 0 {
-		return 0, actionsAlreadyPinned, actionsSkipped, actionsWithLatest, actionsWithoutTags, totalActions, nil
-	}
-
-	// Process actions concurrently
-	if len(actionsToPin) > 0 {
-		fmt.Printf("🔄 Processing %d action(s) for pinning...\n", len(actionsToPin))
-	}
-
-	numWorkers := runtime.NumCPU()
-	if numWorkers > len(actionsToPin) {
-		numWorkers = len(actionsToPin)
-	}
-
-	actionsChan := make(chan actionPin, len(actionsToPin))
-	resultsChan := make(chan actionPin, len(actionsToPin))
-	var wg sync.WaitGroup
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go pinActionsWorker(actionsChan, resultsChan, &wg)
-	}
-
-	// Send actions to workers
-	for _, action := range actionsToPin {
-		actionsChan <- action
-	}
-	close(actionsChan)
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
-	// Collect results
-	pinnedActions := make(map[string]actionPin)
-	for result := range resultsChan {
-		key := fmt.Sprintf("%s@%s", result.action, result.version)
-		pinnedActions[key] = result
-	}
-
-	// Apply updates to the content
-	updatedContent := originalContent
-	currentDate := time.Now().Format("2006-01-02")
-	actionsPinned := 0
-
-	for _, jobData := range jobs {
-		if job, ok := jobData.(map[string]interface{}); ok {
-			if steps, ok := job["steps"].([]interface{}); ok {
-				for _, stepData := range steps {
-					if step, ok := stepData.(map[string]interface{}); ok {
-						if uses, ok := step["uses"].(string); ok && uses != "" && !shouldSkipAction(uses) {
-							if action, version, err := parseActionReference(uses); err == nil {
-								key := fmt.Sprintf("%s@%s", action, version)
-								if pinned, exists := pinnedActions[key]; exists {
-									if pinned.err == nil {
-										pinnedUses := fmt.Sprintf("%s@%s # %s on %s", action, pinned.hash, pinned.resolvedVersion, currentDate)
-										updatedContent = strings.Replace(updatedContent, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", pinnedUses), 1)
-										actionsPinned++
-										if debug {
-											fmt.Printf("Pinned %s@%s to %s\n", action, version, pinned.hash)
-										}
-									} else if errors.Is(pinned.err, errUnresolvedVersion) {
-										todoComment := fmt.Sprintf("# %s on %s, TODO: Pin to a commit hash", version, currentDate)
-										newUses := fmt.Sprintf("%s %s", uses, todoComment)
-										updatedContent = strings.Replace(updatedContent, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", newUses), 1)
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	if updatedContent != originalContent {
-		if err := os.WriteFile(filePath, []byte(updatedContent), 0644); err != nil {
-			return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to write updated file: %v", err)
-		}
-	}
-	return actionsPinned, actionsAlreadyPinned, actionsSkipped, actionsWithLatest, actionsWithoutTags, totalActions, nil
-}
 
 func shouldSkipAction(uses string) bool {
 	// Skip local actions (relative paths)
@@ -1998,6 +1849,9 @@ func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sy
 }
 
 // stub — replaced in Task 4
+// NOTE: 'workflow' is parsed from originalContent and may be stale relative to 'content'
+// after pinActionsPass has run. Task 4 implementation should use raw string operations
+// on 'content' directly rather than relying on the passed workflow map.
 func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]interface{}) (string, int, error) {
 	return content, 0, nil
 }
