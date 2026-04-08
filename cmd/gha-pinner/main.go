@@ -1108,6 +1108,39 @@ func patchLocalRepository(repoDir string) error {
 	_ = totalHardenInjected
 	_ = totalRunnersReplaced
 
+	// Scan composite action files in .github/actions/
+	actionsBaseDir := filepath.Join(repoDir, ".github", "actions")
+	if _, statErr := os.Stat(actionsBaseDir); statErr == nil {
+		walkErr := filepath.WalkDir(actionsBaseDir, func(path string, d os.DirEntry, walkEntryErr error) error {
+			if walkEntryErr != nil {
+				return walkEntryErr
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(path, ".yml") && !strings.HasSuffix(path, ".yaml") {
+				return nil
+			}
+			res, err := patcher.patchFile(path)
+			if err != nil {
+				if debug {
+					fmt.Printf("Warning: failed to process composite action %s: %v\n", path, err)
+				}
+				return nil
+			}
+			totalActionsPinned += res.actionsPinned
+			totalActionsAlreadyPinned += res.actionsAlreadyPinned
+			totalActionsSkipped += res.actionsSkipped
+			totalActionsWithLatest += res.actionsWithLatest
+			totalActionsWithoutTags += res.actionsWithoutTags
+			totalActionsFound += res.totalActions
+			return nil
+		})
+		if walkErr != nil && debug {
+			fmt.Printf("Warning: error walking actions directory: %v\n", walkErr)
+		}
+	}
+
 	// Summary of actions processed
 	fmt.Printf("\n📊 Summary:\n")
 	fmt.Printf("   • Total actions found: %d\n", totalActionsFound)
