@@ -27,6 +27,13 @@ func TestResolveRunnerLabel_WindowsDefault(t *testing.T) {
 	}
 }
 
+func TestResolveRunnerLabel_MacOSDefault(t *testing.T) {
+	got := resolveRunnerLabel("macos-latest", nil)
+	if got != "macos-15" {
+		t.Errorf("expected default macos-15, got %s", got)
+	}
+}
+
 func TestResolveRunnerLabel_UnknownLabelUnchanged(t *testing.T) {
 	got := resolveRunnerLabel("self-hosted", nil)
 	if got != "self-hosted" {

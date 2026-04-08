@@ -2031,6 +2031,8 @@ func resolveRunnerLabel(label string, customMap map[string]string) string {
 // Returns updated content and count of replacements made.
 func pinRunnersPass(content string, customMap map[string]string) (string, int) {
 	runnerLabelRe := regexp.MustCompile(`(?m)^(\s*runs-on:\s+)([a-zA-Z0-9][a-zA-Z0-9\-\.]*)(\s*(?:#.*)?$)`)
+	// Note: quoted labels (e.g. runs-on: "ubuntu-latest") are intentionally not matched —
+	// they are rare in practice and require a separate regex pattern.
 	replaced := 0
 	updated := runnerLabelRe.ReplaceAllStringFunc(content, func(match string) string {
 		parts := runnerLabelRe.FindStringSubmatch(match)
