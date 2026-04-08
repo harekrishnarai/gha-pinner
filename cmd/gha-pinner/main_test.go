@@ -242,7 +242,7 @@ jobs:
 	}
 }
 
-func TestPrintContextualTips_Output(t *testing.T) {
+func TestTipsCount_TriggerConditions(t *testing.T) {
 	// We test the conditions that trigger tips rather than stdout content.
 	tests := []struct {
 		inject   bool

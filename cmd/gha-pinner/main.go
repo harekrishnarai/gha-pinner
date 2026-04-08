@@ -1164,6 +1164,10 @@ func patchLocalRepository(repoDir string) error {
 		fmt.Printf("ℹ️  No GitHub Actions found in workflow files\n")
 	} else {
 		fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
+		if skipPRCreation {
+			fmt.Printf("   • Repository location: %s\n", repoDir)
+			fmt.Printf("   • Changes are ready for review and manual commit\n")
+		}
 	}
 
 	if totalActionsWithLatest > 0 {
