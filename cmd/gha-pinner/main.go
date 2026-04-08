@@ -2003,9 +2003,49 @@ func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]in
 	return updated, count, nil
 }
 
-// stub — replaced in Task 5
-func pinRunnersPass(content string, _ map[string]string) (string, int) {
-	return content, 0
+var defaultRunnerMap = map[string]string{
+	"ubuntu-latest":  "ubuntu-24.04",
+	"windows-latest": "windows-2022",
+	"macos-latest":   "macos-15",
+}
+
+// resolveRunnerLabel returns the pinned label for a given runner using a 2-tier lookup:
+// 1. customMap (from --runner-map flag)
+// 2. defaultRunnerMap (hardcoded fallback)
+// Returns the original label unchanged if no mapping found.
+func resolveRunnerLabel(label string, customMap map[string]string) string {
+	if customMap != nil {
+		if v, ok := customMap[label]; ok {
+			return v
+		}
+	}
+	if v, ok := defaultRunnerMap[label]; ok {
+		return v
+	}
+	return label
+}
+
+// pinRunnersPass replaces floating runner labels with versioned equivalents.
+// Matrix expressions (${{ ... }}) are skipped naturally — the regex only matches
+// plain alphanumeric labels.
+// Returns updated content and count of replacements made.
+func pinRunnersPass(content string, customMap map[string]string) (string, int) {
+	runnerLabelRe := regexp.MustCompile(`(?m)^(\s*runs-on:\s+)([a-zA-Z0-9][a-zA-Z0-9\-\.]*)(\s*(?:#.*)?$)`)
+	replaced := 0
+	updated := runnerLabelRe.ReplaceAllStringFunc(content, func(match string) string {
+		parts := runnerLabelRe.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match
+		}
+		prefix, label, suffix := parts[1], parts[2], parts[3]
+		newLabel := resolveRunnerLabel(label, customMap)
+		if newLabel == label {
+			return match
+		}
+		replaced++
+		return prefix + newLabel + suffix
+	})
+	return updated, replaced
 }
 
 func getPRBodyForRepository(repoDir string) string {
