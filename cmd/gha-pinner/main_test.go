@@ -213,3 +213,31 @@ func TestCleanupFunction(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkflowPatcher_PatchFile_AlreadyPinned(t *testing.T) {
+	tempDir := t.TempDir()
+	content := `name: Test
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+`
+	path := filepath.Join(tempDir, "test.yml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &WorkflowPatcher{injectHardenRunner: false, egressPolicy: "audit", pinRunners: false}
+	res, err := p.patchFile(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.actionsAlreadyPinned != 1 {
+		t.Errorf("expected 1 already-pinned, got %d", res.actionsAlreadyPinned)
+	}
+	if res.actionsPinned != 0 {
+		t.Errorf("expected 0 pinned, got %d", res.actionsPinned)
+	}
+}

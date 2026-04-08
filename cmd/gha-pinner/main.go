@@ -83,6 +83,24 @@ type ExecResult struct {
 	ExitCode int
 }
 
+type patchResult struct {
+	actionsPinned        int
+	actionsAlreadyPinned int
+	actionsSkipped       int
+	actionsWithLatest    int
+	actionsWithoutTags   int
+	totalActions         int
+	hardenInjected       int
+	runnersReplaced      int
+}
+
+type WorkflowPatcher struct {
+	injectHardenRunner bool
+	egressPolicy       string
+	pinRunners         bool
+	runnerMap          map[string]string
+}
+
 func main() {
 	root := newRootCmd()
 	if err := root.Execute(); err != nil {
@@ -1061,21 +1079,34 @@ func patchLocalRepository(repoDir string) error {
 	totalActionsWithLatest := 0
 	totalActionsWithoutTags := 0
 	totalActionsFound := 0
+	totalHardenInjected := 0
+	totalRunnersReplaced := 0
+
+	patcher := &WorkflowPatcher{
+		injectHardenRunner: injectHardenRunner,
+		egressPolicy:       egressPolicy,
+		pinRunners:         pinRunners,
+		runnerMap:          runnerMap,
+	}
 
 	for _, file := range files {
 		if !file.IsDir() && (strings.HasSuffix(file.Name(), ".yml") || strings.HasSuffix(file.Name(), ".yaml")) {
-			pinned, alreadyPinned, skipped, withLatest, withoutTags, totalActions, err := processWorkflowFile(filepath.Join(workflowsDir, file.Name()))
+			res, err := patcher.patchFile(filepath.Join(workflowsDir, file.Name()))
 			if err != nil {
 				return fmt.Errorf("failed to process workflow file %s: %v", file.Name(), err)
 			}
-			totalActionsPinned += pinned
-			totalActionsAlreadyPinned += alreadyPinned
-			totalActionsSkipped += skipped
-			totalActionsWithLatest += withLatest
-			totalActionsWithoutTags += withoutTags
-			totalActionsFound += totalActions
+			totalActionsPinned += res.actionsPinned
+			totalActionsAlreadyPinned += res.actionsAlreadyPinned
+			totalActionsSkipped += res.actionsSkipped
+			totalActionsWithLatest += res.actionsWithLatest
+			totalActionsWithoutTags += res.actionsWithoutTags
+			totalActionsFound += res.totalActions
+			totalHardenInjected += res.hardenInjected
+			totalRunnersReplaced += res.runnersReplaced
 		}
 	}
+	_ = totalHardenInjected
+	_ = totalRunnersReplaced
 
 	// Summary of actions processed
 	fmt.Printf("\n📊 Summary:\n")
@@ -1110,6 +1141,176 @@ func patchLocalRepository(repoDir string) error {
 		fmt.Printf("🚨 Security Warning: %d action(s) found without any tag/ref - these are insecure as they default to the mutable default branch\n", totalActionsWithoutTags)
 	}
 	return nil
+}
+
+func (p *WorkflowPatcher) patchFile(filePath string) (patchResult, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return patchResult{}, fmt.Errorf("failed to read file: %v", err)
+	}
+	originalContent := string(content)
+
+	var workflow map[string]interface{}
+	if err := yaml.Unmarshal(content, &workflow); err != nil {
+		return patchResult{}, fmt.Errorf("failed to parse YAML: %v", err)
+	}
+
+	_, hasJobs := workflow["jobs"]
+	_, hasRuns := workflow["runs"]
+	if !hasJobs && !hasRuns {
+		return patchResult{}, nil
+	}
+	isComposite := !hasJobs && hasRuns
+
+	current, res, err := pinActionsPass(originalContent, workflow, isComposite)
+	if err != nil {
+		return patchResult{}, err
+	}
+
+	if p.injectHardenRunner && !isComposite {
+		updated, count, injErr := p.injectHardenRunnerPass(current, workflow)
+		if injErr != nil {
+			if debug {
+				fmt.Printf("Warning: harden-runner injection failed for %s: %v\n", filePath, injErr)
+			}
+		} else {
+			current = updated
+			res.hardenInjected = count
+		}
+	}
+
+	if p.pinRunners && !isComposite {
+		updated, count := pinRunnersPass(current, p.runnerMap)
+		current = updated
+		res.runnersReplaced = count
+	}
+
+	if current != originalContent {
+		if err := os.WriteFile(filePath, []byte(current), 0644); err != nil {
+			return patchResult{}, fmt.Errorf("failed to write updated file: %v", err)
+		}
+	}
+	return res, nil
+}
+
+func pinActionsPass(content string, workflow map[string]interface{}, isComposite bool) (string, patchResult, error) {
+	var res patchResult
+
+	var allJobSteps [][]map[string]interface{}
+	if isComposite {
+		if runs, ok := workflow["runs"].(map[string]interface{}); ok {
+			if steps, ok := runs["steps"].([]interface{}); ok {
+				var jobSteps []map[string]interface{}
+				for _, s := range steps {
+					if step, ok := s.(map[string]interface{}); ok {
+						jobSteps = append(jobSteps, step)
+					}
+				}
+				allJobSteps = append(allJobSteps, jobSteps)
+			}
+		}
+	} else {
+		if jobs, ok := workflow["jobs"].(map[string]interface{}); ok {
+			for _, jobData := range jobs {
+				if job, ok := jobData.(map[string]interface{}); ok {
+					if steps, ok := job["steps"].([]interface{}); ok {
+						var jobSteps []map[string]interface{}
+						for _, s := range steps {
+							if step, ok := s.(map[string]interface{}); ok {
+								jobSteps = append(jobSteps, step)
+							}
+						}
+						allJobSteps = append(allJobSteps, jobSteps)
+					}
+				}
+			}
+		}
+	}
+
+	var actionsToPin []actionPin
+	for _, steps := range allJobSteps {
+		for _, step := range steps {
+			if uses, ok := step["uses"].(string); ok && uses != "" {
+				res.totalActions++
+				if shouldSkipAction(uses) {
+					res.actionsSkipped++
+					continue
+				}
+				if matched, _ := regexp.MatchString(`@[a-f0-9]{40}`, uses); matched {
+					res.actionsAlreadyPinned++
+					continue
+				}
+				if strings.Contains(uses, "@latest") {
+					res.actionsWithLatest++
+				}
+				if action, version, err := parseActionReference(uses); err == nil {
+					actionsToPin = append(actionsToPin, actionPin{action: action, version: version})
+				} else if strings.Contains(err.Error(), "action without tag/ref") {
+					res.actionsWithoutTags++
+				}
+			}
+		}
+	}
+
+	if len(actionsToPin) == 0 {
+		return content, res, nil
+	}
+
+	fmt.Printf("🔄 Processing %d action(s) for pinning...\n", len(actionsToPin))
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(actionsToPin) {
+		numWorkers = len(actionsToPin)
+	}
+
+	actionsChan := make(chan actionPin, len(actionsToPin))
+	resultsChan := make(chan actionPin, len(actionsToPin))
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go pinActionsWorker(actionsChan, resultsChan, &wg)
+	}
+	for _, a := range actionsToPin {
+		actionsChan <- a
+	}
+	close(actionsChan)
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	pinnedActions := make(map[string]actionPin)
+	for result := range resultsChan {
+		key := fmt.Sprintf("%s@%s", result.action, result.version)
+		pinnedActions[key] = result
+	}
+
+	updated := content
+	currentDate := time.Now().Format("2006-01-02")
+	for _, steps := range allJobSteps {
+		for _, step := range steps {
+			if uses, ok := step["uses"].(string); ok && uses != "" && !shouldSkipAction(uses) {
+				if action, version, err := parseActionReference(uses); err == nil {
+					key := fmt.Sprintf("%s@%s", action, version)
+					if pinned, exists := pinnedActions[key]; exists {
+						if pinned.err == nil {
+							pinnedUses := fmt.Sprintf("%s@%s # %s on %s", action, pinned.hash, pinned.resolvedVersion, currentDate)
+							updated = strings.Replace(updated, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", pinnedUses), 1)
+							res.actionsPinned++
+							if debug {
+								fmt.Printf("Pinned %s@%s to %s\n", action, version, pinned.hash)
+							}
+						} else if errors.Is(pinned.err, errUnresolvedVersion) {
+							todoComment := fmt.Sprintf("# %s on %s, TODO: Pin to a commit hash", version, currentDate)
+							updated = strings.Replace(updated, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s %s", uses, todoComment), 1)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return updated, res, nil
 }
 
 func processWorkflowFile(filePath string) (int, int, int, int, int, int, error) {
@@ -1794,6 +1995,16 @@ func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sy
 		}
 		results <- action
 	}
+}
+
+// stub — replaced in Task 4
+func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]interface{}) (string, int, error) {
+	return content, 0, nil
+}
+
+// stub — replaced in Task 5
+func pinRunnersPass(content string, _ map[string]string) (string, int) {
+	return content, 0
 }
 
 func getPRBodyForRepository(repoDir string) string {
