@@ -1108,9 +1108,6 @@ func patchLocalRepository(repoDir string) error {
 			totalRunnersReplaced += res.runnersReplaced
 		}
 	}
-	_ = totalHardenInjected
-	_ = totalRunnersReplaced
-
 	// Scan composite action files in .github/actions/
 	actionsBaseDir := filepath.Join(repoDir, ".github", "actions")
 	if _, statErr := os.Stat(actionsBaseDir); statErr == nil {
@@ -1149,6 +1146,12 @@ func patchLocalRepository(repoDir string) error {
 	fmt.Printf("   • Total actions found: %d\n", totalActionsFound)
 	fmt.Printf("   • Actions pinned: %d\n", totalActionsPinned)
 	fmt.Printf("   • Actions already pinned: %d\n", totalActionsAlreadyPinned)
+	if injectHardenRunner {
+		fmt.Printf("   • Harden-runner injected: %d job(s)\n", totalHardenInjected)
+	}
+	if pinRunners {
+		fmt.Printf("   • Runner labels pinned: %d\n", totalRunnersReplaced)
+	}
 	fmt.Printf("   • Actions with @latest: %d\n", totalActionsWithLatest)
 	fmt.Printf("   • Actions without tag/ref: %d\n", totalActionsWithoutTags)
 	fmt.Printf("   • Actions skipped: %d\n", totalActionsSkipped)
@@ -1159,23 +1162,18 @@ func patchLocalRepository(repoDir string) error {
 		fmt.Printf("ℹ️  No GitHub Actions found that need pinning (only local actions or already pinned)\n")
 	} else if totalActionsPinned == 0 {
 		fmt.Printf("ℹ️  No GitHub Actions found in workflow files\n")
-	} else if totalActionsPinned > 0 {
-		if skipPRCreation {
-			fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
-			fmt.Printf("   • Repository location: %s\n", repoDir)
-			fmt.Printf("   • Changes are ready for review and manual commit\n")
-		} else {
-			fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
-		}
+	} else {
+		fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
 	}
 
 	if totalActionsWithLatest > 0 {
 		fmt.Printf("⚠️  Warning: %d action(s) using @latest tag detected - these should be pinned for better security\n", totalActionsWithLatest)
 	}
-
 	if totalActionsWithoutTags > 0 {
 		fmt.Printf("🚨 Security Warning: %d action(s) found without any tag/ref - these are insecure as they default to the mutable default branch\n", totalActionsWithoutTags)
 	}
+
+	printContextualTips(injectHardenRunner, pinRunners)
 	return nil
 }
 
@@ -1346,7 +1344,6 @@ func pinActionsPass(content string, workflow map[string]interface{}, isComposite
 
 	return updated, res, nil
 }
-
 
 func shouldSkipAction(uses string) bool {
 	// Skip local actions (relative paths)
@@ -1869,6 +1866,33 @@ type actionPin struct {
 	hash            string
 	resolvedVersion string
 	err             error
+}
+
+// tipsCount returns how many contextual tips would be shown given current flag state.
+func tipsCount(hardenRunnerActive, pinRunnersActive bool) int {
+	count := 0
+	if !hardenRunnerActive {
+		count++
+	}
+	if !pinRunnersActive {
+		count++
+	}
+	return count
+}
+
+// printContextualTips prints tips for features the user did not activate in this run.
+func printContextualTips(hardenRunnerActive, pinRunnersActive bool) {
+	if tipsCount(hardenRunnerActive, pinRunnersActive) == 0 {
+		return
+	}
+	fmt.Printf("\n💡 Tips:\n")
+	if !hardenRunnerActive {
+		fmt.Printf("   • Use --inject-harden-runner to add step-security/harden-runner to every job" +
+			" (runtime supply chain protection)\n")
+	}
+	if !pinRunnersActive {
+		fmt.Printf("   • Use --pin-runners to replace ubuntu-latest with a versioned runner label (e.g. ubuntu-24.04)\n")
+	}
 }
 
 func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sync.WaitGroup) {

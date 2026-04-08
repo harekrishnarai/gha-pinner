@@ -241,3 +241,24 @@ jobs:
 		t.Errorf("expected 0 pinned, got %d", res.actionsPinned)
 	}
 }
+
+func TestPrintContextualTips_Output(t *testing.T) {
+	// We test the conditions that trigger tips rather than stdout content.
+	tests := []struct {
+		inject   bool
+		pin      bool
+		wantTips bool
+	}{
+		{false, false, true}, // neither feature used → show both tips
+		{true, false, true},  // only harden-runner used → show runner tip
+		{false, true, true},  // only pin-runners used → show harden-runner tip
+		{true, true, false},  // both used → no tips
+	}
+
+	for _, tc := range tests {
+		hasTips := tipsCount(tc.inject, tc.pin) > 0
+		if hasTips != tc.wantTips {
+			t.Errorf("inject=%v pin=%v: expected wantTips=%v, got %v", tc.inject, tc.pin, tc.wantTips, hasTips)
+		}
+	}
+}
