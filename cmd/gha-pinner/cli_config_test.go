@@ -60,3 +60,70 @@ func getenvOrEmpty(key string) string {
 	v, _ := os.LookupEnv(key)
 	return v
 }
+
+func saveHardeningGlobals() (bool, string, bool, []string) {
+	return injectHardenRunner, egressPolicy, pinRunners, runnerMapRaw
+}
+
+func restoreHardeningGlobals(inject bool, policy string, pinR bool, mapRaw []string) {
+	injectHardenRunner = inject
+	egressPolicy = policy
+	pinRunners = pinR
+	runnerMapRaw = mapRaw
+}
+
+func TestValidateRuntimeConfig_InvalidEgressPolicy(t *testing.T) {
+	oldMode, oldToken, oldWorkers := saveAuthGlobals()
+	oldInject, oldPolicy, oldPin, oldMap := saveHardeningGlobals()
+	t.Cleanup(func() {
+		restoreAuthGlobals(oldMode, oldToken, oldWorkers)
+		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap)
+	})
+
+	authMode = "gh"
+	repoWorkers = 2
+	injectHardenRunner = true
+	egressPolicy = "dangerous"
+
+	if err := validateRuntimeConfig(); err == nil {
+		t.Fatal("expected validation error for invalid egress-policy")
+	}
+}
+
+func TestValidateRuntimeConfig_ValidEgressPolicies(t *testing.T) {
+	oldMode, oldToken, oldWorkers := saveAuthGlobals()
+	oldInject, oldPolicy, oldPin, oldMap := saveHardeningGlobals()
+	t.Cleanup(func() {
+		restoreAuthGlobals(oldMode, oldToken, oldWorkers)
+		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap)
+	})
+
+	authMode = "gh"
+	repoWorkers = 2
+	injectHardenRunner = true
+
+	for _, policy := range []string{"audit", "block"} {
+		egressPolicy = policy
+		if err := validateRuntimeConfig(); err != nil {
+			t.Fatalf("expected no error for egress-policy=%q, got: %v", policy, err)
+		}
+	}
+}
+
+func TestValidateRuntimeConfig_EgressPolicyIgnoredWithoutInjectFlag(t *testing.T) {
+	oldMode, oldToken, oldWorkers := saveAuthGlobals()
+	oldInject, oldPolicy, oldPin, oldMap := saveHardeningGlobals()
+	t.Cleanup(func() {
+		restoreAuthGlobals(oldMode, oldToken, oldWorkers)
+		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap)
+	})
+
+	authMode = "gh"
+	repoWorkers = 2
+	injectHardenRunner = false
+	egressPolicy = "dangerous"
+
+	if err := validateRuntimeConfig(); err != nil {
+		t.Fatalf("expected no error when --inject-harden-runner is false, got: %v", err)
+	}
+}

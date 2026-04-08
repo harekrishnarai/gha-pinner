@@ -37,6 +37,11 @@ var (
 	errUnresolvedVersion = errors.New("unresolved version")
 	errNeedsFork         = errors.New("needs fork")
 	skipActions          = []string{}
+	injectHardenRunner   = false
+	egressPolicy         = "audit"
+	pinRunners           = false
+	runnerMapRaw         = []string{}
+	runnerMap            = map[string]string{}
 	prBody               = `# Pin GitHub Actions to commit hashes
 
 This pull request pins all GitHub Actions in workflow files to specific commit hashes to improve security and ensure reproducible builds.
@@ -111,6 +116,10 @@ func newRootCmd() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&outputDir, "output", "", "Custom output directory for repositories (only with --no-pr)")
 	rootCmd.PersistentFlags().StringVar(&authMode, "auth-mode", "gh", "Authentication mode: gh or pat")
 	rootCmd.PersistentFlags().IntVar(&repoWorkers, "repo-workers", 4, "Number of repositories to process in parallel for organization/file commands")
+	rootCmd.PersistentFlags().BoolVar(&injectHardenRunner, "inject-harden-runner", false, "Inject step-security/harden-runner as the first step in every job")
+	rootCmd.PersistentFlags().StringVar(&egressPolicy, "egress-policy", "audit", "Egress policy for injected harden-runner: audit or block")
+	rootCmd.PersistentFlags().BoolVar(&pinRunners, "pin-runners", false, "Replace floating runner labels (e.g. ubuntu-latest) with versioned equivalents")
+	rootCmd.PersistentFlags().StringArrayVar(&runnerMapRaw, "runner-map", []string{}, "Custom runner label mapping, e.g. --runner-map ubuntu-latest=ubuntu-24.04")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
@@ -214,6 +223,33 @@ func applyGlobalFlagsFromCmd(cmd *cobra.Command) {
 			repoWorkers = val
 		}
 	}
+	if flags.Lookup("inject-harden-runner") != nil {
+		if val, err := flags.GetBool("inject-harden-runner"); err == nil {
+			injectHardenRunner = val
+		}
+	}
+	if flags.Lookup("egress-policy") != nil {
+		if val, err := flags.GetString("egress-policy"); err == nil {
+			egressPolicy = val
+		}
+	}
+	if flags.Lookup("pin-runners") != nil {
+		if val, err := flags.GetBool("pin-runners"); err == nil {
+			pinRunners = val
+		}
+	}
+	if flags.Lookup("runner-map") != nil {
+		if vals, err := flags.GetStringArray("runner-map"); err == nil {
+			runnerMapRaw = vals
+			runnerMap = make(map[string]string)
+			for _, entry := range runnerMapRaw {
+				parts := strings.SplitN(entry, "=", 2)
+				if len(parts) == 2 {
+					runnerMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	}
 }
 
 func validateRuntimeConfig() error {
@@ -233,6 +269,10 @@ func validateRuntimeConfig() error {
 
 	if repoWorkers < 1 {
 		return fmt.Errorf("--repo-workers must be >= 1")
+	}
+
+	if injectHardenRunner && egressPolicy != "audit" && egressPolicy != "block" {
+		return fmt.Errorf("invalid --egress-policy value %q (allowed: audit, block)", egressPolicy)
 	}
 
 	return nil
