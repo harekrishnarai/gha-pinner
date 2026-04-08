@@ -99,6 +99,9 @@ type WorkflowPatcher struct {
 	egressPolicy       string
 	pinRunners         bool
 	runnerMap          map[string]string
+	// cached harden-runner resolution (populated lazily on first use)
+	hardenRunnerTag string
+	hardenRunnerSHA string
 }
 
 func main() {
@@ -1885,7 +1888,7 @@ func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sy
 func buildHardenRunnerBlock(indent, sha, version, egressPolicy string) string {
 	inner := indent + "  "
 	return fmt.Sprintf(
-		"%s- name: Harden the runner (Audit all outbound calls)\n%suses: step-security/harden-runner@%s # %s\n%swith:\n%s  egress-policy: %s\n",
+		"%s- name: Harden the runner\n%suses: step-security/harden-runner@%s # %s\n%swith:\n%s  egress-policy: %s\n",
 		indent, inner, sha, version, inner, inner, egressPolicy,
 	)
 }
@@ -1919,7 +1922,7 @@ func injectHardenRunnerStep(content, sha, version, egressPolicy string) (string,
 				firstStepIndent = jLine[:len(jLine)-len(jStripped)]
 				break
 			}
-			break
+			continue
 		}
 
 		if firstStepIdx == -1 || firstStepIndent == "" {
@@ -1982,16 +1985,21 @@ func getLatestHardenRunnerTag() (string, error) {
 }
 
 // injectHardenRunnerPass resolves the latest harden-runner SHA and injects it into the workflow.
+// Tag and SHA are resolved once and cached on the WorkflowPatcher for reuse across multiple files.
 func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]interface{}) (string, int, error) {
-	tag, err := getLatestHardenRunnerTag()
-	if err != nil {
-		return content, 0, fmt.Errorf("could not get latest harden-runner tag: %v", err)
+	if p.hardenRunnerTag == "" {
+		tag, err := getLatestHardenRunnerTag()
+		if err != nil {
+			return content, 0, fmt.Errorf("getLatestHardenRunnerTag: %w", err)
+		}
+		sha, resolvedTag, err := getCommitHashFromVersion("step-security/harden-runner", tag)
+		if err != nil {
+			return content, 0, fmt.Errorf("getCommitHashFromVersion for harden-runner: %w", err)
+		}
+		p.hardenRunnerTag = resolvedTag
+		p.hardenRunnerSHA = sha
 	}
-	sha, resolvedTag, err := getCommitHashFromVersion("step-security/harden-runner", tag)
-	if err != nil {
-		return content, 0, fmt.Errorf("could not resolve harden-runner SHA for tag %s: %v", tag, err)
-	}
-	updated, count := injectHardenRunnerStep(content, sha, resolvedTag, p.egressPolicy)
+	updated, count := injectHardenRunnerStep(content, p.hardenRunnerSHA, p.hardenRunnerTag, p.egressPolicy)
 	return updated, count, nil
 }
 

@@ -108,3 +108,25 @@ jobs:
 		t.Errorf("expected egress-policy: block in output:\n%s", updated)
 	}
 }
+
+func TestInjectHardenRunnerStep_CommentBeforeFirstStep(t *testing.T) {
+	content := `jobs:
+  build:
+    steps:
+      # checkout the repo
+      - uses: actions/checkout@abc123
+`
+	result, count := injectHardenRunnerStep(content, "deadbeef", "v2.0.0", "audit")
+	if count != 1 {
+		t.Fatalf("expected 1 injection, got %d", count)
+	}
+	if !strings.Contains(result, "step-security/harden-runner@deadbeef") {
+		t.Error("expected harden-runner to be injected")
+	}
+	// harden-runner should appear before actions/checkout
+	hrIdx := strings.Index(result, "step-security/harden-runner")
+	checkoutIdx := strings.Index(result, "actions/checkout")
+	if hrIdx > checkoutIdx {
+		t.Error("expected harden-runner to appear before actions/checkout")
+	}
+}
