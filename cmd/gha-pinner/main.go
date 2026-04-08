@@ -1881,12 +1881,118 @@ func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sy
 	}
 }
 
-// stub — replaced in Task 4
-// NOTE: 'workflow' is parsed from originalContent and may be stale relative to 'content'
-// after pinActionsPass has run. Task 4 implementation should use raw string operations
-// on 'content' directly rather than relying on the passed workflow map.
+// buildHardenRunnerBlock returns a YAML step block for harden-runner with the given indentation.
+func buildHardenRunnerBlock(indent, sha, version, egressPolicy string) string {
+	inner := indent + "  "
+	return fmt.Sprintf(
+		"%s- name: Harden the runner (Audit all outbound calls)\n%suses: step-security/harden-runner@%s # %s\n%swith:\n%s  egress-policy: %s\n",
+		indent, inner, sha, version, inner, inner, egressPolicy,
+	)
+}
+
+// injectHardenRunnerStep inserts the harden-runner step as the first step in each job
+// that doesn't already have it. sha and version must be pre-resolved.
+// Returns updated content and the number of jobs where injection occurred.
+// Uses raw line manipulation — does not rely on parsed YAML map.
+func injectHardenRunnerStep(content, sha, version, egressPolicy string) (string, int) {
+	lines := strings.Split(content, "\n")
+	insertBefore := map[int]string{}
+	injected := 0
+
+	for i, line := range lines {
+		stripped := strings.TrimLeft(line, " \t")
+		if stripped != "steps:" {
+			continue
+		}
+
+		// Find the first step marker (line starting with "- ") after this steps: line
+		firstStepIdx := -1
+		firstStepIndent := ""
+		for j := i + 1; j < len(lines); j++ {
+			jLine := lines[j]
+			if strings.TrimSpace(jLine) == "" {
+				continue
+			}
+			jStripped := strings.TrimLeft(jLine, " \t")
+			if strings.HasPrefix(jStripped, "- ") {
+				firstStepIdx = j
+				firstStepIndent = jLine[:len(jLine)-len(jStripped)]
+				break
+			}
+			break
+		}
+
+		if firstStepIdx == -1 || firstStepIndent == "" {
+			continue
+		}
+
+		// Check if the first step block already references harden-runner
+		hasHarden := false
+		for k := firstStepIdx; k < len(lines); k++ {
+			if k > firstStepIdx {
+				kStripped := strings.TrimLeft(lines[k], " \t")
+				if strings.HasPrefix(kStripped, "- ") {
+					break
+				}
+			}
+			if strings.Contains(lines[k], "step-security/harden-runner") {
+				hasHarden = true
+				break
+			}
+		}
+
+		if !hasHarden {
+			insertBefore[firstStepIdx] = buildHardenRunnerBlock(firstStepIndent, sha, version, egressPolicy)
+			injected++
+		}
+	}
+
+	if len(insertBefore) == 0 {
+		return content, 0
+	}
+
+	var sb strings.Builder
+	for i, line := range lines {
+		if block, ok := insertBefore[i]; ok {
+			sb.WriteString(block)
+		}
+		sb.WriteString(line)
+		if i < len(lines)-1 {
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String(), injected
+}
+
+// getLatestHardenRunnerTag fetches the latest release tag of step-security/harden-runner.
+func getLatestHardenRunnerTag() (string, error) {
+	result := githubAPI("GET", "repos/step-security/harden-runner/releases/latest", nil)
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("failed to fetch harden-runner release: %s", result.Stderr)
+	}
+	var release map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Stdout), &release); err != nil {
+		return "", fmt.Errorf("failed to parse release response: %v", err)
+	}
+	tag, ok := release["tag_name"].(string)
+	if !ok || tag == "" {
+		return "", fmt.Errorf("tag_name missing in release response")
+	}
+	return tag, nil
+}
+
+// injectHardenRunnerPass resolves the latest harden-runner SHA and injects it into the workflow.
 func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]interface{}) (string, int, error) {
-	return content, 0, nil
+	tag, err := getLatestHardenRunnerTag()
+	if err != nil {
+		return content, 0, fmt.Errorf("could not get latest harden-runner tag: %v", err)
+	}
+	sha, resolvedTag, err := getCommitHashFromVersion("step-security/harden-runner", tag)
+	if err != nil {
+		return content, 0, fmt.Errorf("could not resolve harden-runner SHA for tag %s: %v", tag, err)
+	}
+	updated, count := injectHardenRunnerStep(content, sha, resolvedTag, p.egressPolicy)
+	return updated, count, nil
 }
 
 // stub — replaced in Task 5
