@@ -718,7 +718,7 @@ func patchRepository(repo Repository) error {
 		fmt.Printf("🔍 Changes detected in repository: %s\n", repo.Name)
 
 		// Show the diff for review
-		diffResult := execCommandWithDir(repoDir, "git", "diff", ".github/workflows")
+		diffResult := execCommandWithDir(repoDir, "git", "diff", ".github/workflows", ".github/actions")
 		if diffResult.ExitCode == 0 && diffResult.Stdout != "" {
 			fmt.Printf("\n📋 Workflow changes preview:\n")
 			fmt.Printf("---\n%s---\n", diffResult.Stdout)
@@ -738,7 +738,7 @@ func patchRepository(repo Repository) error {
 
 	commands := [][]string{
 		{"git", "checkout", "-b", branchName},
-		{"git", "add", ".github/workflows"},
+		{"git", "add", ".github/workflows", ".github/actions"},
 		{"git", "commit", "-m", getPRTitleForRepository(originalRepo) + "\n\nPin GitHub Actions to commit hashes for improved security and reproducible builds"},
 		{"git", "push", "origin", branchName},
 	}
@@ -1123,9 +1123,7 @@ func patchLocalRepository(repoDir string) error {
 			}
 			res, err := patcher.patchFile(path)
 			if err != nil {
-				if debug {
-					fmt.Printf("Warning: failed to process composite action %s: %v\n", path, err)
-				}
+				fmt.Printf("⚠️  Warning: failed to process composite action %s: %v\n", path, err)
 				return nil
 			}
 			totalActionsPinned += res.actionsPinned
@@ -2012,7 +2010,8 @@ func getLatestHardenRunnerTag() (string, error) {
 	return tag, nil
 }
 
-// injectHardenRunnerPass resolves the latest harden-runner SHA and injects it into the workflow.
+// injectHardenRunnerPass injects step-security/harden-runner as the first step in every job.
+// The workflow map parameter is unused; it exists for interface consistency with other passes.
 // Tag and SHA are resolved once and cached on the WorkflowPatcher for reuse across multiple files.
 func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]interface{}) (string, int, error) {
 	if p.hardenRunnerTag == "" {
