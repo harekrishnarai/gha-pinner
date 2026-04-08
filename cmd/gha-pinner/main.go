@@ -1186,7 +1186,8 @@ func (p *WorkflowPatcher) patchFile(filePath string) (patchResult, error) {
 	if err != nil {
 		return patchResult{}, fmt.Errorf("failed to read file: %v", err)
 	}
-	originalContent := string(content)
+	// Normalize Windows line endings so all passes can do simple string comparisons.
+	originalContent := strings.ReplaceAll(string(content), "\r\n", "\n")
 
 	var workflow map[string]interface{}
 	if err := yaml.Unmarshal(content, &workflow); err != nil {
