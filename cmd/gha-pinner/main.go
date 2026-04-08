@@ -736,9 +736,13 @@ func patchRepository(repo Repository) error {
 		fmt.Printf("Current branch: %s\n", currentBranch)
 	}
 
+	gitAddArgs := []string{"add", ".github/workflows"}
+	if _, err := os.Stat(filepath.Join(repoDir, ".github", "actions")); err == nil {
+		gitAddArgs = append(gitAddArgs, ".github/actions")
+	}
 	commands := [][]string{
 		{"git", "checkout", "-b", branchName},
-		{"git", "add", ".github/workflows", ".github/actions"},
+		append([]string{"git"}, gitAddArgs...),
 		{"git", "commit", "-m", getPRTitleForRepository(originalRepo) + "\n\nPin GitHub Actions to commit hashes for improved security and reproducible builds"},
 		{"git", "push", "origin", branchName},
 	}
