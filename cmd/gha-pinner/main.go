@@ -42,29 +42,6 @@ var (
 	pinRunners           = false
 	runnerMapRaw         = []string{}
 	runnerMap            = map[string]string{}
-	prBody               = `# Pin GitHub Actions to commit hashes
-
-This pull request pins all GitHub Actions in workflow files to specific commit hashes to improve security and ensure reproducible builds.
-
-## Changes Made
-
-- Converted version tags (e.g., ` + "`v3`" + `, ` + "`v4`" + `) to commit hashes
-- Added comments showing the original version and date for reference
-- Preserved all existing functionality while improving security
-
-## Benefits
-
-- **Security**: Prevents supply chain attacks by ensuring immutable action references  
-- **Reproducibility**: Guarantees the same action version is used across all runs
-- **Auditability**: Clear tracking of which specific version of each action is being used
-
-## Review Notes
-
-- All pinned actions maintain their original functionality
-- Comments preserve the original version information with dates for easy reference
-- No workflow behavior changes are expected
-
-This change follows GitHub's security best practices for action pinning.`
 )
 
 type Repository struct {
@@ -81,6 +58,18 @@ type ExecResult struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
+}
+
+// lastRunSummary holds the totals from the most recent patchLocalRepository call,
+// so buildDynamicPRBody can generate an accurate PR description.
+var lastRunSummary struct {
+	actionsPinned   int
+	alreadyPinned   int
+	hardenInjected  int
+	runnersReplaced int
+	withLatest      int
+	withoutTags     int
+	totalFound      int
 }
 
 type patchResult struct {
@@ -1143,6 +1132,15 @@ func patchLocalRepository(repoDir string) error {
 		}
 	}
 
+	// Capture totals for dynamic PR body generation
+	lastRunSummary.actionsPinned = totalActionsPinned
+	lastRunSummary.alreadyPinned = totalActionsAlreadyPinned
+	lastRunSummary.hardenInjected = totalHardenInjected
+	lastRunSummary.runnersReplaced = totalRunnersReplaced
+	lastRunSummary.withLatest = totalActionsWithLatest
+	lastRunSummary.withoutTags = totalActionsWithoutTags
+	lastRunSummary.totalFound = totalActionsFound
+
 	// Summary of actions processed
 	fmt.Printf("\n📊 Summary:\n")
 	fmt.Printf("   • Total actions found: %d\n", totalActionsFound)
@@ -2082,9 +2080,9 @@ func pinRunnersPass(content string, customMap map[string]string) (string, int) {
 }
 
 func getPRBodyForRepository(repoDir string) string {
-	// If user wants to ignore PR templates, use full body
+	// If user wants to ignore PR templates, use dynamic body directly
 	if ignorePRTemplates {
-		return prBody
+		return buildDynamicPRBody()
 	}
 
 	// Check for PR templates in the repository
@@ -2108,8 +2106,55 @@ func getPRBodyForRepository(repoDir string) string {
 		}
 	}
 
-	// No template found, use full body
-	return prBody
+	// No template found, use dynamic body
+	return buildDynamicPRBody()
+}
+
+func buildDynamicPRBody() string {
+	var sb strings.Builder
+
+	sb.WriteString("## Summary\n\n")
+	sb.WriteString("This PR applies the following supply-chain hardening to your GitHub Actions workflows:\n\n")
+
+	sb.WriteString(fmt.Sprintf("- **Action pinning**: %d `uses:` reference(s) pinned to immutable commit SHAs", lastRunSummary.actionsPinned))
+	if lastRunSummary.alreadyPinned > 0 {
+		sb.WriteString(fmt.Sprintf(" (%d already pinned)", lastRunSummary.alreadyPinned))
+	}
+	sb.WriteString("\n")
+
+	if injectHardenRunner {
+		sb.WriteString(fmt.Sprintf("- **Harden Runner**: `step-security/harden-runner` injected into %d job(s) (egress-policy: `%s`)\n",
+			lastRunSummary.hardenInjected, egressPolicy))
+	}
+	if pinRunners {
+		sb.WriteString(fmt.Sprintf("- **Runner pinning**: %d runner label(s) replaced with versioned equivalents\n",
+			lastRunSummary.runnersReplaced))
+	}
+
+	sb.WriteString("\n## Benefits\n\n")
+	sb.WriteString("- **Security**: Immutable action references prevent supply chain attacks\n")
+	sb.WriteString("- **Reproducibility**: Same action version is guaranteed across all runs\n")
+	sb.WriteString("- **Auditability**: Comments preserve the original version tag for easy reference\n")
+	if injectHardenRunner {
+		sb.WriteString("- **Runtime protection**: Harden Runner monitors/blocks unexpected outbound network calls\n")
+	}
+	if pinRunners {
+		sb.WriteString("- **Runner stability**: Versioned runner labels prevent unexpected environment changes\n")
+	}
+
+	sb.WriteString("\n## Review Notes\n\n")
+	sb.WriteString("- All pinned actions maintain their original functionality\n")
+	sb.WriteString("- No workflow behavior changes are expected\n")
+	if lastRunSummary.withLatest > 0 {
+		sb.WriteString(fmt.Sprintf("- Warning: %d action(s) using `@latest` detected — consider pinning these manually\n",
+			lastRunSummary.withLatest))
+	}
+	if lastRunSummary.withoutTags > 0 {
+		sb.WriteString(fmt.Sprintf("- Warning: %d action(s) found without any tag or ref — these default to the mutable default branch\n",
+			lastRunSummary.withoutTags))
+	}
+
+	return sb.String()
 }
 
 func integratePRBodyWithTemplate(template string) string {

@@ -80,13 +80,12 @@ func TestGetTempDir(t *testing.T) {
 }
 
 func TestGeneratePRBody(t *testing.T) {
-	body := prBody
+	body := buildDynamicPRBody()
 
 	expectedContains := []string{
-		"Pin GitHub Actions",
-		"commit hashes",
-		"security",
-		"reproducible builds",
+		"commit SHAs",
+		"Security",
+		"Action pinning",
 	}
 
 	for _, expected := range expectedContains {
