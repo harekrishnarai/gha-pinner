@@ -61,23 +61,28 @@ func getenvOrEmpty(key string) string {
 	return v
 }
 
-func saveHardeningGlobals() (bool, string, bool, []string) {
-	return injectHardenRunner, egressPolicy, pinRunners, runnerMapRaw
+func saveHardeningGlobals() (bool, string, bool, []string, map[string]string) {
+	cp := make(map[string]string, len(runnerMap))
+	for k, v := range runnerMap {
+		cp[k] = v
+	}
+	return injectHardenRunner, egressPolicy, pinRunners, runnerMapRaw, cp
 }
 
-func restoreHardeningGlobals(inject bool, policy string, pinR bool, mapRaw []string) {
+func restoreHardeningGlobals(inject bool, policy string, pinR bool, mapRaw []string, mapParsed map[string]string) {
 	injectHardenRunner = inject
 	egressPolicy = policy
 	pinRunners = pinR
 	runnerMapRaw = mapRaw
+	runnerMap = mapParsed
 }
 
 func TestValidateRuntimeConfig_InvalidEgressPolicy(t *testing.T) {
 	oldMode, oldToken, oldWorkers := saveAuthGlobals()
-	oldInject, oldPolicy, oldPin, oldMap := saveHardeningGlobals()
+	oldInject, oldPolicy, oldPin, oldMap, oldRunnerMap := saveHardeningGlobals()
 	t.Cleanup(func() {
 		restoreAuthGlobals(oldMode, oldToken, oldWorkers)
-		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap)
+		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap, oldRunnerMap)
 	})
 
 	authMode = "gh"
@@ -92,10 +97,10 @@ func TestValidateRuntimeConfig_InvalidEgressPolicy(t *testing.T) {
 
 func TestValidateRuntimeConfig_ValidEgressPolicies(t *testing.T) {
 	oldMode, oldToken, oldWorkers := saveAuthGlobals()
-	oldInject, oldPolicy, oldPin, oldMap := saveHardeningGlobals()
+	oldInject, oldPolicy, oldPin, oldMap, oldRunnerMap := saveHardeningGlobals()
 	t.Cleanup(func() {
 		restoreAuthGlobals(oldMode, oldToken, oldWorkers)
-		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap)
+		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap, oldRunnerMap)
 	})
 
 	authMode = "gh"
@@ -112,10 +117,10 @@ func TestValidateRuntimeConfig_ValidEgressPolicies(t *testing.T) {
 
 func TestValidateRuntimeConfig_EgressPolicyIgnoredWithoutInjectFlag(t *testing.T) {
 	oldMode, oldToken, oldWorkers := saveAuthGlobals()
-	oldInject, oldPolicy, oldPin, oldMap := saveHardeningGlobals()
+	oldInject, oldPolicy, oldPin, oldMap, oldRunnerMap := saveHardeningGlobals()
 	t.Cleanup(func() {
 		restoreAuthGlobals(oldMode, oldToken, oldWorkers)
-		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap)
+		restoreHardeningGlobals(oldInject, oldPolicy, oldPin, oldMap, oldRunnerMap)
 	})
 
 	authMode = "gh"

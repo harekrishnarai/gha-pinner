@@ -230,7 +230,7 @@ func applyGlobalFlagsFromCmd(cmd *cobra.Command) {
 	}
 	if flags.Lookup("egress-policy") != nil {
 		if val, err := flags.GetString("egress-policy"); err == nil {
-			egressPolicy = val
+			egressPolicy = strings.ToLower(strings.TrimSpace(val))
 		}
 	}
 	if flags.Lookup("pin-runners") != nil {
