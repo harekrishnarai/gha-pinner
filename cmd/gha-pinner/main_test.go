@@ -80,13 +80,12 @@ func TestGetTempDir(t *testing.T) {
 }
 
 func TestGeneratePRBody(t *testing.T) {
-	body := prBody
+	body := buildDynamicPRBody()
 
 	expectedContains := []string{
-		"Pin GitHub Actions",
-		"commit hashes",
-		"security",
-		"reproducible builds",
+		"commit SHAs",
+		"Security",
+		"Action pinning",
 	}
 
 	for _, expected := range expectedContains {
@@ -210,6 +209,55 @@ func TestCleanupFunction(t *testing.T) {
 	for _, dir := range testDirs {
 		if _, err := os.Stat(dir); err == nil {
 			t.Errorf("Directory should have been cleaned up: %s", dir)
+		}
+	}
+}
+
+func TestWorkflowPatcher_PatchFile_AlreadyPinned(t *testing.T) {
+	tempDir := t.TempDir()
+	content := `name: Test
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+`
+	path := filepath.Join(tempDir, "test.yml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &WorkflowPatcher{injectHardenRunner: false, egressPolicy: "audit", pinRunners: false}
+	res, err := p.patchFile(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.actionsAlreadyPinned != 1 {
+		t.Errorf("expected 1 already-pinned, got %d", res.actionsAlreadyPinned)
+	}
+	if res.actionsPinned != 0 {
+		t.Errorf("expected 0 pinned, got %d", res.actionsPinned)
+	}
+}
+
+func TestTipsCount_TriggerConditions(t *testing.T) {
+	// We test the conditions that trigger tips rather than stdout content.
+	tests := []struct {
+		inject   bool
+		pin      bool
+		wantTips bool
+	}{
+		{false, false, true}, // neither feature used → show both tips
+		{true, false, true},  // only harden-runner used → show runner tip
+		{false, true, true},  // only pin-runners used → show harden-runner tip
+		{true, true, false},  // both used → no tips
+	}
+
+	for _, tc := range tests {
+		hasTips := tipsCount(tc.inject, tc.pin) > 0
+		if hasTips != tc.wantTips {
+			t.Errorf("inject=%v pin=%v: expected wantTips=%v, got %v", tc.inject, tc.pin, tc.wantTips, hasTips)
 		}
 	}
 }

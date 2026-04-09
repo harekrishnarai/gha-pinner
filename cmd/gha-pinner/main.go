@@ -37,29 +37,11 @@ var (
 	errUnresolvedVersion = errors.New("unresolved version")
 	errNeedsFork         = errors.New("needs fork")
 	skipActions          = []string{}
-	prBody               = `# Pin GitHub Actions to commit hashes
-
-This pull request pins all GitHub Actions in workflow files to specific commit hashes to improve security and ensure reproducible builds.
-
-## Changes Made
-
-- Converted version tags (e.g., ` + "`v3`" + `, ` + "`v4`" + `) to commit hashes
-- Added comments showing the original version and date for reference
-- Preserved all existing functionality while improving security
-
-## Benefits
-
-- **Security**: Prevents supply chain attacks by ensuring immutable action references  
-- **Reproducibility**: Guarantees the same action version is used across all runs
-- **Auditability**: Clear tracking of which specific version of each action is being used
-
-## Review Notes
-
-- All pinned actions maintain their original functionality
-- Comments preserve the original version information with dates for easy reference
-- No workflow behavior changes are expected
-
-This change follows GitHub's security best practices for action pinning.`
+	injectHardenRunner   = false
+	egressPolicy         = "audit"
+	pinRunners           = false
+	runnerMapRaw         = []string{}
+	runnerMap            = map[string]string{}
 )
 
 type Repository struct {
@@ -76,6 +58,39 @@ type ExecResult struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
+}
+
+// lastRunSummary holds the totals from the most recent patchLocalRepository call,
+// so buildDynamicPRBody can generate an accurate PR description.
+var lastRunSummary struct {
+	actionsPinned   int
+	alreadyPinned   int
+	hardenInjected  int
+	runnersReplaced int
+	withLatest      int
+	withoutTags     int
+	totalFound      int
+}
+
+type patchResult struct {
+	actionsPinned        int
+	actionsAlreadyPinned int
+	actionsSkipped       int
+	actionsWithLatest    int
+	actionsWithoutTags   int
+	totalActions         int
+	hardenInjected       int
+	runnersReplaced      int
+}
+
+type WorkflowPatcher struct {
+	injectHardenRunner bool
+	egressPolicy       string
+	pinRunners         bool
+	runnerMap          map[string]string
+	// cached harden-runner resolution (populated lazily on first use)
+	hardenRunnerTag string
+	hardenRunnerSHA string
 }
 
 func main() {
@@ -111,6 +126,10 @@ func newRootCmd() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&outputDir, "output", "", "Custom output directory for repositories (only with --no-pr)")
 	rootCmd.PersistentFlags().StringVar(&authMode, "auth-mode", "gh", "Authentication mode: gh or pat")
 	rootCmd.PersistentFlags().IntVar(&repoWorkers, "repo-workers", 4, "Number of repositories to process in parallel for organization/file commands")
+	rootCmd.PersistentFlags().BoolVar(&injectHardenRunner, "inject-harden-runner", false, "Inject step-security/harden-runner as the first step in every job")
+	rootCmd.PersistentFlags().StringVar(&egressPolicy, "egress-policy", "audit", "Egress policy for injected harden-runner: audit or block")
+	rootCmd.PersistentFlags().BoolVar(&pinRunners, "pin-runners", false, "Replace floating runner labels (e.g. ubuntu-latest) with versioned equivalents")
+	rootCmd.PersistentFlags().StringArrayVar(&runnerMapRaw, "runner-map", []string{}, "Custom runner label mapping, e.g. --runner-map ubuntu-latest=ubuntu-24.04")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
@@ -214,6 +233,33 @@ func applyGlobalFlagsFromCmd(cmd *cobra.Command) {
 			repoWorkers = val
 		}
 	}
+	if flags.Lookup("inject-harden-runner") != nil {
+		if val, err := flags.GetBool("inject-harden-runner"); err == nil {
+			injectHardenRunner = val
+		}
+	}
+	if flags.Lookup("egress-policy") != nil {
+		if val, err := flags.GetString("egress-policy"); err == nil {
+			egressPolicy = strings.ToLower(strings.TrimSpace(val))
+		}
+	}
+	if flags.Lookup("pin-runners") != nil {
+		if val, err := flags.GetBool("pin-runners"); err == nil {
+			pinRunners = val
+		}
+	}
+	if flags.Lookup("runner-map") != nil {
+		if vals, err := flags.GetStringArray("runner-map"); err == nil {
+			runnerMapRaw = vals
+			runnerMap = make(map[string]string)
+			for _, entry := range runnerMapRaw {
+				parts := strings.SplitN(entry, "=", 2)
+				if len(parts) == 2 {
+					runnerMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	}
 }
 
 func validateRuntimeConfig() error {
@@ -233,6 +279,10 @@ func validateRuntimeConfig() error {
 
 	if repoWorkers < 1 {
 		return fmt.Errorf("--repo-workers must be >= 1")
+	}
+
+	if injectHardenRunner && egressPolicy != "audit" && egressPolicy != "block" {
+		return fmt.Errorf("invalid --egress-policy value %q (allowed: audit, block)", egressPolicy)
 	}
 
 	return nil
@@ -657,7 +707,7 @@ func patchRepository(repo Repository) error {
 		fmt.Printf("🔍 Changes detected in repository: %s\n", repo.Name)
 
 		// Show the diff for review
-		diffResult := execCommandWithDir(repoDir, "git", "diff", ".github/workflows")
+		diffResult := execCommandWithDir(repoDir, "git", "diff", ".github/workflows", ".github/actions")
 		if diffResult.ExitCode == 0 && diffResult.Stdout != "" {
 			fmt.Printf("\n📋 Workflow changes preview:\n")
 			fmt.Printf("---\n%s---\n", diffResult.Stdout)
@@ -675,9 +725,13 @@ func patchRepository(repo Repository) error {
 		fmt.Printf("Current branch: %s\n", currentBranch)
 	}
 
+	gitAddArgs := []string{"add", ".github/workflows"}
+	if _, err := os.Stat(filepath.Join(repoDir, ".github", "actions")); err == nil {
+		gitAddArgs = append(gitAddArgs, ".github/actions")
+	}
 	commands := [][]string{
 		{"git", "checkout", "-b", branchName},
-		{"git", "add", ".github/workflows"},
+		append([]string{"git"}, gitAddArgs...),
 		{"git", "commit", "-m", getPRTitleForRepository(originalRepo) + "\n\nPin GitHub Actions to commit hashes for improved security and reproducible builds"},
 		{"git", "push", "origin", branchName},
 	}
@@ -1021,27 +1075,83 @@ func patchLocalRepository(repoDir string) error {
 	totalActionsWithLatest := 0
 	totalActionsWithoutTags := 0
 	totalActionsFound := 0
+	totalHardenInjected := 0
+	totalRunnersReplaced := 0
+
+	patcher := &WorkflowPatcher{
+		injectHardenRunner: injectHardenRunner,
+		egressPolicy:       egressPolicy,
+		pinRunners:         pinRunners,
+		runnerMap:          runnerMap,
+	}
 
 	for _, file := range files {
 		if !file.IsDir() && (strings.HasSuffix(file.Name(), ".yml") || strings.HasSuffix(file.Name(), ".yaml")) {
-			pinned, alreadyPinned, skipped, withLatest, withoutTags, totalActions, err := processWorkflowFile(filepath.Join(workflowsDir, file.Name()))
+			res, err := patcher.patchFile(filepath.Join(workflowsDir, file.Name()))
 			if err != nil {
 				return fmt.Errorf("failed to process workflow file %s: %v", file.Name(), err)
 			}
-			totalActionsPinned += pinned
-			totalActionsAlreadyPinned += alreadyPinned
-			totalActionsSkipped += skipped
-			totalActionsWithLatest += withLatest
-			totalActionsWithoutTags += withoutTags
-			totalActionsFound += totalActions
+			totalActionsPinned += res.actionsPinned
+			totalActionsAlreadyPinned += res.actionsAlreadyPinned
+			totalActionsSkipped += res.actionsSkipped
+			totalActionsWithLatest += res.actionsWithLatest
+			totalActionsWithoutTags += res.actionsWithoutTags
+			totalActionsFound += res.totalActions
+			totalHardenInjected += res.hardenInjected
+			totalRunnersReplaced += res.runnersReplaced
 		}
 	}
+	// Scan composite action files in .github/actions/
+	actionsBaseDir := filepath.Join(repoDir, ".github", "actions")
+	if _, statErr := os.Stat(actionsBaseDir); statErr == nil {
+		walkErr := filepath.WalkDir(actionsBaseDir, func(path string, d os.DirEntry, walkEntryErr error) error {
+			if walkEntryErr != nil {
+				return walkEntryErr
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(path, ".yml") && !strings.HasSuffix(path, ".yaml") {
+				return nil
+			}
+			res, err := patcher.patchFile(path)
+			if err != nil {
+				fmt.Printf("⚠️  Warning: failed to process composite action %s: %v\n", path, err)
+				return nil
+			}
+			totalActionsPinned += res.actionsPinned
+			totalActionsAlreadyPinned += res.actionsAlreadyPinned
+			totalActionsSkipped += res.actionsSkipped
+			totalActionsWithLatest += res.actionsWithLatest
+			totalActionsWithoutTags += res.actionsWithoutTags
+			totalActionsFound += res.totalActions
+			return nil
+		})
+		if walkErr != nil && debug {
+			fmt.Printf("Warning: error walking actions directory: %v\n", walkErr)
+		}
+	}
+
+	// Capture totals for dynamic PR body generation
+	lastRunSummary.actionsPinned = totalActionsPinned
+	lastRunSummary.alreadyPinned = totalActionsAlreadyPinned
+	lastRunSummary.hardenInjected = totalHardenInjected
+	lastRunSummary.runnersReplaced = totalRunnersReplaced
+	lastRunSummary.withLatest = totalActionsWithLatest
+	lastRunSummary.withoutTags = totalActionsWithoutTags
+	lastRunSummary.totalFound = totalActionsFound
 
 	// Summary of actions processed
 	fmt.Printf("\n📊 Summary:\n")
 	fmt.Printf("   • Total actions found: %d\n", totalActionsFound)
 	fmt.Printf("   • Actions pinned: %d\n", totalActionsPinned)
 	fmt.Printf("   • Actions already pinned: %d\n", totalActionsAlreadyPinned)
+	if injectHardenRunner {
+		fmt.Printf("   • Harden-runner injected: %d job(s)\n", totalHardenInjected)
+	}
+	if pinRunners {
+		fmt.Printf("   • Runner labels pinned: %d\n", totalRunnersReplaced)
+	}
 	fmt.Printf("   • Actions with @latest: %d\n", totalActionsWithLatest)
 	fmt.Printf("   • Actions without tag/ref: %d\n", totalActionsWithoutTags)
 	fmt.Printf("   • Actions skipped: %d\n", totalActionsSkipped)
@@ -1052,96 +1162,145 @@ func patchLocalRepository(repoDir string) error {
 		fmt.Printf("ℹ️  No GitHub Actions found that need pinning (only local actions or already pinned)\n")
 	} else if totalActionsPinned == 0 {
 		fmt.Printf("ℹ️  No GitHub Actions found in workflow files\n")
-	} else if totalActionsPinned > 0 {
+	} else {
+		fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
 		if skipPRCreation {
-			fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
 			fmt.Printf("   • Repository location: %s\n", repoDir)
 			fmt.Printf("   • Changes are ready for review and manual commit\n")
-		} else {
-			fmt.Printf("✅ Successfully pinned %d GitHub Action(s) to commit hashes\n", totalActionsPinned)
 		}
 	}
 
 	if totalActionsWithLatest > 0 {
 		fmt.Printf("⚠️  Warning: %d action(s) using @latest tag detected - these should be pinned for better security\n", totalActionsWithLatest)
 	}
-
 	if totalActionsWithoutTags > 0 {
 		fmt.Printf("🚨 Security Warning: %d action(s) found without any tag/ref - these are insecure as they default to the mutable default branch\n", totalActionsWithoutTags)
 	}
+
+	printContextualTips(injectHardenRunner, pinRunners)
 	return nil
 }
 
-func processWorkflowFile(filePath string) (int, int, int, int, int, int, error) {
+func (p *WorkflowPatcher) patchFile(filePath string) (patchResult, error) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to read file: %v", err)
+		return patchResult{}, fmt.Errorf("failed to read file: %v", err)
 	}
+	raw := string(content)
+	// Remember whether the file uses Windows line endings so we can restore them
+	// on write. All internal processing uses LF-only strings.
+	hasCRLF := strings.Contains(raw, "\r\n")
+	originalContent := strings.ReplaceAll(raw, "\r\n", "\n")
 
-	originalContent := string(content)
 	var workflow map[string]interface{}
 	if err := yaml.Unmarshal(content, &workflow); err != nil {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to parse YAML: %v", err)
+		return patchResult{}, fmt.Errorf("failed to parse YAML: %v", err)
 	}
 
-	jobs, ok := workflow["jobs"].(map[string]interface{})
-	if !ok {
-		return 0, 0, 0, 0, 0, 0, nil
+	_, hasJobs := workflow["jobs"]
+	_, hasRuns := workflow["runs"]
+	if !hasJobs && !hasRuns {
+		return patchResult{}, nil
+	}
+	isComposite := !hasJobs && hasRuns
+
+	current, res, err := pinActionsPass(originalContent, workflow, isComposite)
+	if err != nil {
+		return patchResult{}, err
 	}
 
-	// Collect all actions that need to be pinned
-	var actionsToPin []actionPin
-	var actionsAlreadyPinned int
-	var actionsSkipped int
-	var actionsWithLatest int
-	var actionsWithoutTags int
-	var totalActions int
+	if p.injectHardenRunner && !isComposite {
+		updated, count, injErr := p.injectHardenRunnerPass(current, workflow)
+		if injErr != nil {
+			fmt.Printf("⚠️  Warning: harden-runner injection failed for %s: %v\n", filePath, injErr)
+		} else {
+			current = updated
+			res.hardenInjected = count
+		}
+	}
 
-	for _, jobData := range jobs {
-		if job, ok := jobData.(map[string]interface{}); ok {
-			if steps, ok := job["steps"].([]interface{}); ok {
-				for _, stepData := range steps {
-					if step, ok := stepData.(map[string]interface{}); ok {
-						if uses, ok := step["uses"].(string); ok && uses != "" {
-							totalActions++
+	if p.pinRunners && !isComposite {
+		updated, count := pinRunnersPass(current, p.runnerMap)
+		current = updated
+		res.runnersReplaced = count
+	}
 
-							if shouldSkipAction(uses) {
-								actionsSkipped++
-								continue
-							}
+	if current != originalContent {
+		out := current
+		if hasCRLF {
+			out = strings.ReplaceAll(current, "\n", "\r\n")
+		}
+		if err := os.WriteFile(filePath, []byte(out), 0644); err != nil {
+			return patchResult{}, fmt.Errorf("failed to write updated file: %v", err)
+		}
+	}
+	return res, nil
+}
 
-							// Check if already pinned (has commit hash)
-							if matched, _ := regexp.MatchString(`@[a-f0-9]{40}`, uses); matched {
-								actionsAlreadyPinned++
-								continue
-							}
+func pinActionsPass(content string, workflow map[string]interface{}, isComposite bool) (string, patchResult, error) {
+	var res patchResult
 
-							// Check for @latest tag
-							if strings.Contains(uses, "@latest") {
-								actionsWithLatest++
-							}
-
-							if action, version, err := parseActionReference(uses); err == nil {
-								actionsToPin = append(actionsToPin, actionPin{action: action, version: version})
-							} else if strings.Contains(err.Error(), "action without tag/ref") {
-								// Action without tag/ref - this is insecure
-								actionsWithoutTags++
+	var allJobSteps [][]map[string]interface{}
+	if isComposite {
+		if runs, ok := workflow["runs"].(map[string]interface{}); ok {
+			if steps, ok := runs["steps"].([]interface{}); ok {
+				var jobSteps []map[string]interface{}
+				for _, s := range steps {
+					if step, ok := s.(map[string]interface{}); ok {
+						jobSteps = append(jobSteps, step)
+					}
+				}
+				allJobSteps = append(allJobSteps, jobSteps)
+			}
+		}
+	} else {
+		if jobs, ok := workflow["jobs"].(map[string]interface{}); ok {
+			for _, jobData := range jobs {
+				if job, ok := jobData.(map[string]interface{}); ok {
+					if steps, ok := job["steps"].([]interface{}); ok {
+						var jobSteps []map[string]interface{}
+						for _, s := range steps {
+							if step, ok := s.(map[string]interface{}); ok {
+								jobSteps = append(jobSteps, step)
 							}
 						}
+						allJobSteps = append(allJobSteps, jobSteps)
 					}
 				}
 			}
 		}
 	}
 
-	if len(actionsToPin) == 0 {
-		return 0, actionsAlreadyPinned, actionsSkipped, actionsWithLatest, actionsWithoutTags, totalActions, nil
+	var actionsToPin []actionPin
+	for _, steps := range allJobSteps {
+		for _, step := range steps {
+			if uses, ok := step["uses"].(string); ok && uses != "" {
+				res.totalActions++
+				if shouldSkipAction(uses) {
+					res.actionsSkipped++
+					continue
+				}
+				if matched, _ := regexp.MatchString(`@[a-f0-9]{40}`, uses); matched {
+					res.actionsAlreadyPinned++
+					continue
+				}
+				if strings.Contains(uses, "@latest") {
+					res.actionsWithLatest++
+				}
+				if action, version, err := parseActionReference(uses); err == nil {
+					actionsToPin = append(actionsToPin, actionPin{action: action, version: version})
+				} else if strings.Contains(err.Error(), "action without tag/ref") {
+					res.actionsWithoutTags++
+				}
+			}
+		}
 	}
 
-	// Process actions concurrently
-	if len(actionsToPin) > 0 {
-		fmt.Printf("🔄 Processing %d action(s) for pinning...\n", len(actionsToPin))
+	if len(actionsToPin) == 0 {
+		return content, res, nil
 	}
+
+	fmt.Printf("🔄 Processing %d action(s) for pinning...\n", len(actionsToPin))
 
 	numWorkers := runtime.NumCPU()
 	if numWorkers > len(actionsToPin) {
@@ -1151,60 +1310,43 @@ func processWorkflowFile(filePath string) (int, int, int, int, int, int, error) 
 	actionsChan := make(chan actionPin, len(actionsToPin))
 	resultsChan := make(chan actionPin, len(actionsToPin))
 	var wg sync.WaitGroup
-
-	// Start workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go pinActionsWorker(actionsChan, resultsChan, &wg)
 	}
-
-	// Send actions to workers
-	for _, action := range actionsToPin {
-		actionsChan <- action
+	for _, a := range actionsToPin {
+		actionsChan <- a
 	}
 	close(actionsChan)
-
-	// Wait for all workers to complete
 	go func() {
 		wg.Wait()
 		close(resultsChan)
 	}()
 
-	// Collect results
 	pinnedActions := make(map[string]actionPin)
 	for result := range resultsChan {
 		key := fmt.Sprintf("%s@%s", result.action, result.version)
 		pinnedActions[key] = result
 	}
 
-	// Apply updates to the content
-	updatedContent := originalContent
+	updated := content
 	currentDate := time.Now().Format("2006-01-02")
-	actionsPinned := 0
-
-	for _, jobData := range jobs {
-		if job, ok := jobData.(map[string]interface{}); ok {
-			if steps, ok := job["steps"].([]interface{}); ok {
-				for _, stepData := range steps {
-					if step, ok := stepData.(map[string]interface{}); ok {
-						if uses, ok := step["uses"].(string); ok && uses != "" && !shouldSkipAction(uses) {
-							if action, version, err := parseActionReference(uses); err == nil {
-								key := fmt.Sprintf("%s@%s", action, version)
-								if pinned, exists := pinnedActions[key]; exists {
-									if pinned.err == nil {
-										pinnedUses := fmt.Sprintf("%s@%s # %s on %s", action, pinned.hash, pinned.resolvedVersion, currentDate)
-										updatedContent = strings.Replace(updatedContent, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", pinnedUses), 1)
-										actionsPinned++
-										if debug {
-											fmt.Printf("Pinned %s@%s to %s\n", action, version, pinned.hash)
-										}
-									} else if errors.Is(pinned.err, errUnresolvedVersion) {
-										todoComment := fmt.Sprintf("# %s on %s, TODO: Pin to a commit hash", version, currentDate)
-										newUses := fmt.Sprintf("%s %s", uses, todoComment)
-										updatedContent = strings.Replace(updatedContent, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", newUses), 1)
-									}
-								}
+	for _, steps := range allJobSteps {
+		for _, step := range steps {
+			if uses, ok := step["uses"].(string); ok && uses != "" && !shouldSkipAction(uses) {
+				if action, version, err := parseActionReference(uses); err == nil {
+					key := fmt.Sprintf("%s@%s", action, version)
+					if pinned, exists := pinnedActions[key]; exists {
+						if pinned.err == nil {
+							pinnedUses := fmt.Sprintf("%s@%s # %s on %s", action, pinned.hash, pinned.resolvedVersion, currentDate)
+							updated = strings.Replace(updated, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s", pinnedUses), 1)
+							res.actionsPinned++
+							if debug {
+								fmt.Printf("Pinned %s@%s to %s\n", action, version, pinned.hash)
 							}
+						} else if errors.Is(pinned.err, errUnresolvedVersion) {
+							todoComment := fmt.Sprintf("# %s on %s, TODO: Pin to a commit hash", version, currentDate)
+							updated = strings.Replace(updated, fmt.Sprintf("uses: %s", uses), fmt.Sprintf("uses: %s %s", uses, todoComment), 1)
 						}
 					}
 				}
@@ -1212,12 +1354,7 @@ func processWorkflowFile(filePath string) (int, int, int, int, int, int, error) 
 		}
 	}
 
-	if updatedContent != originalContent {
-		if err := os.WriteFile(filePath, []byte(updatedContent), 0644); err != nil {
-			return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to write updated file: %v", err)
-		}
-	}
-	return actionsPinned, actionsAlreadyPinned, actionsSkipped, actionsWithLatest, actionsWithoutTags, totalActions, nil
+	return updated, res, nil
 }
 
 func shouldSkipAction(uses string) bool {
@@ -1743,6 +1880,33 @@ type actionPin struct {
 	err             error
 }
 
+// tipsCount returns how many contextual tips would be shown given current flag state.
+func tipsCount(hardenRunnerActive, pinRunnersActive bool) int {
+	count := 0
+	if !hardenRunnerActive {
+		count++
+	}
+	if !pinRunnersActive {
+		count++
+	}
+	return count
+}
+
+// printContextualTips prints tips for features the user did not activate in this run.
+func printContextualTips(hardenRunnerActive, pinRunnersActive bool) {
+	if tipsCount(hardenRunnerActive, pinRunnersActive) == 0 {
+		return
+	}
+	fmt.Printf("\n💡 Tips:\n")
+	if !hardenRunnerActive {
+		fmt.Printf("   • Use --inject-harden-runner to add step-security/harden-runner to every job" +
+			" (runtime supply chain protection)\n")
+	}
+	if !pinRunnersActive {
+		fmt.Printf("   • Use --pin-runners to replace ubuntu-latest with a versioned runner label (e.g. ubuntu-24.04)\n")
+	}
+}
+
 func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for action := range actions {
@@ -1756,10 +1920,177 @@ func pinActionsWorker(actions <-chan actionPin, results chan<- actionPin, wg *sy
 	}
 }
 
+// buildHardenRunnerBlock returns a YAML step block for harden-runner with the given indentation.
+func buildHardenRunnerBlock(indent, sha, version, egressPolicy string) string {
+	inner := indent + "  "
+	return fmt.Sprintf(
+		"%s- name: Harden the runner\n%suses: step-security/harden-runner@%s # %s\n%swith:\n%s  egress-policy: %s\n",
+		indent, inner, sha, version, inner, inner, egressPolicy,
+	)
+}
+
+// injectHardenRunnerStep inserts the harden-runner step as the first step in each job
+// that doesn't already have it. sha and version must be pre-resolved.
+// Returns updated content and the number of jobs where injection occurred.
+// Uses raw line manipulation — does not rely on parsed YAML map.
+func injectHardenRunnerStep(content, sha, version, egressPolicy string) (string, int) {
+	lines := strings.Split(content, "\n")
+	insertBefore := map[int]string{}
+	injected := 0
+
+	for i, line := range lines {
+		stripped := strings.TrimLeft(line, " \t")
+		if stripped != "steps:" {
+			continue
+		}
+
+		// Find the first step marker (line starting with "- ") after this steps: line
+		firstStepIdx := -1
+		firstStepIndent := ""
+		for j := i + 1; j < len(lines); j++ {
+			jLine := lines[j]
+			if strings.TrimSpace(jLine) == "" {
+				continue
+			}
+			jStripped := strings.TrimLeft(jLine, " \t")
+			if strings.HasPrefix(jStripped, "- ") {
+				firstStepIdx = j
+				firstStepIndent = jLine[:len(jLine)-len(jStripped)]
+				break
+			}
+			continue
+		}
+
+		if firstStepIdx == -1 || firstStepIndent == "" {
+			continue
+		}
+
+		// Check if the first step block already references harden-runner
+		hasHarden := false
+		for k := firstStepIdx; k < len(lines); k++ {
+			if k > firstStepIdx {
+				kStripped := strings.TrimLeft(lines[k], " \t")
+				if strings.HasPrefix(kStripped, "- ") {
+					break
+				}
+			}
+			if strings.Contains(lines[k], "step-security/harden-runner") {
+				hasHarden = true
+				break
+			}
+		}
+
+		if !hasHarden {
+			insertBefore[firstStepIdx] = buildHardenRunnerBlock(firstStepIndent, sha, version, egressPolicy)
+			injected++
+		}
+	}
+
+	if len(insertBefore) == 0 {
+		return content, 0
+	}
+
+	var sb strings.Builder
+	for i, line := range lines {
+		if block, ok := insertBefore[i]; ok {
+			sb.WriteString(block)
+		}
+		sb.WriteString(line)
+		if i < len(lines)-1 {
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String(), injected
+}
+
+// getLatestHardenRunnerTag fetches the latest release tag of step-security/harden-runner.
+func getLatestHardenRunnerTag() (string, error) {
+	result := githubAPI("GET", "repos/step-security/harden-runner/releases/latest", nil)
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("failed to fetch harden-runner release: %s", result.Stderr)
+	}
+	var release map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Stdout), &release); err != nil {
+		return "", fmt.Errorf("failed to parse release response: %v", err)
+	}
+	tag, ok := release["tag_name"].(string)
+	if !ok || tag == "" {
+		return "", fmt.Errorf("tag_name missing in release response")
+	}
+	return tag, nil
+}
+
+// injectHardenRunnerPass injects step-security/harden-runner as the first step in every job.
+// The workflow map parameter is unused; it exists for interface consistency with other passes.
+// Tag and SHA are resolved once and cached on the WorkflowPatcher for reuse across multiple files.
+func (p *WorkflowPatcher) injectHardenRunnerPass(content string, _ map[string]interface{}) (string, int, error) {
+	if p.hardenRunnerTag == "" {
+		tag, err := getLatestHardenRunnerTag()
+		if err != nil {
+			return content, 0, fmt.Errorf("getLatestHardenRunnerTag: %w", err)
+		}
+		sha, resolvedTag, err := getCommitHashFromVersion("step-security/harden-runner", tag)
+		if err != nil {
+			return content, 0, fmt.Errorf("getCommitHashFromVersion for harden-runner: %w", err)
+		}
+		p.hardenRunnerTag = resolvedTag
+		p.hardenRunnerSHA = sha
+	}
+	updated, count := injectHardenRunnerStep(content, p.hardenRunnerSHA, p.hardenRunnerTag, p.egressPolicy)
+	return updated, count, nil
+}
+
+var defaultRunnerMap = map[string]string{
+	"ubuntu-latest":  "ubuntu-24.04",
+	"windows-latest": "windows-2022",
+	"macos-latest":   "macos-15",
+}
+
+// resolveRunnerLabel returns the pinned label for a given runner using a 2-tier lookup:
+// 1. customMap (from --runner-map flag)
+// 2. defaultRunnerMap (hardcoded fallback)
+// Returns the original label unchanged if no mapping found.
+func resolveRunnerLabel(label string, customMap map[string]string) string {
+	if customMap != nil {
+		if v, ok := customMap[label]; ok {
+			return v
+		}
+	}
+	if v, ok := defaultRunnerMap[label]; ok {
+		return v
+	}
+	return label
+}
+
+// pinRunnersPass replaces floating runner labels with versioned equivalents.
+// Matrix expressions (${{ ... }}) are skipped naturally — the regex only matches
+// plain alphanumeric labels.
+// Returns updated content and count of replacements made.
+func pinRunnersPass(content string, customMap map[string]string) (string, int) {
+	runnerLabelRe := regexp.MustCompile(`(?m)^(\s*runs-on:\s+)([a-zA-Z0-9][a-zA-Z0-9\-\.]*)(\s*(?:#.*)?$)`)
+	// Note: quoted labels (e.g. runs-on: "ubuntu-latest") are intentionally not matched —
+	// they are rare in practice and require a separate regex pattern.
+	replaced := 0
+	updated := runnerLabelRe.ReplaceAllStringFunc(content, func(match string) string {
+		parts := runnerLabelRe.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return match
+		}
+		prefix, label, suffix := parts[1], parts[2], parts[3]
+		newLabel := resolveRunnerLabel(label, customMap)
+		if newLabel == label {
+			return match
+		}
+		replaced++
+		return prefix + newLabel + suffix
+	})
+	return updated, replaced
+}
+
 func getPRBodyForRepository(repoDir string) string {
-	// If user wants to ignore PR templates, use full body
+	// If user wants to ignore PR templates, use dynamic body directly
 	if ignorePRTemplates {
-		return prBody
+		return buildDynamicPRBody()
 	}
 
 	// Check for PR templates in the repository
@@ -1783,8 +2114,55 @@ func getPRBodyForRepository(repoDir string) string {
 		}
 	}
 
-	// No template found, use full body
-	return prBody
+	// No template found, use dynamic body
+	return buildDynamicPRBody()
+}
+
+func buildDynamicPRBody() string {
+	var sb strings.Builder
+
+	sb.WriteString("## Summary\n\n")
+	sb.WriteString("This PR applies the following supply-chain hardening to your GitHub Actions workflows:\n\n")
+
+	sb.WriteString(fmt.Sprintf("- **Action pinning**: %d `uses:` reference(s) pinned to immutable commit SHAs", lastRunSummary.actionsPinned))
+	if lastRunSummary.alreadyPinned > 0 {
+		sb.WriteString(fmt.Sprintf(" (%d already pinned)", lastRunSummary.alreadyPinned))
+	}
+	sb.WriteString("\n")
+
+	if injectHardenRunner {
+		sb.WriteString(fmt.Sprintf("- **Harden Runner**: `step-security/harden-runner` injected into %d job(s) (egress-policy: `%s`)\n",
+			lastRunSummary.hardenInjected, egressPolicy))
+	}
+	if pinRunners {
+		sb.WriteString(fmt.Sprintf("- **Runner pinning**: %d runner label(s) replaced with versioned equivalents\n",
+			lastRunSummary.runnersReplaced))
+	}
+
+	sb.WriteString("\n## Benefits\n\n")
+	sb.WriteString("- **Security**: Immutable action references prevent supply chain attacks\n")
+	sb.WriteString("- **Reproducibility**: Same action version is guaranteed across all runs\n")
+	sb.WriteString("- **Auditability**: Comments preserve the original version tag for easy reference\n")
+	if injectHardenRunner {
+		sb.WriteString("- **Runtime protection**: Harden Runner monitors/blocks unexpected outbound network calls\n")
+	}
+	if pinRunners {
+		sb.WriteString("- **Runner stability**: Versioned runner labels prevent unexpected environment changes\n")
+	}
+
+	sb.WriteString("\n## Review Notes\n\n")
+	sb.WriteString("- All pinned actions maintain their original functionality\n")
+	sb.WriteString("- No workflow behavior changes are expected\n")
+	if lastRunSummary.withLatest > 0 {
+		sb.WriteString(fmt.Sprintf("- Warning: %d action(s) using `@latest` detected — consider pinning these manually\n",
+			lastRunSummary.withLatest))
+	}
+	if lastRunSummary.withoutTags > 0 {
+		sb.WriteString(fmt.Sprintf("- Warning: %d action(s) found without any tag or ref — these default to the mutable default branch\n",
+			lastRunSummary.withoutTags))
+	}
+
+	return sb.String()
 }
 
 func integratePRBodyWithTemplate(template string) string {
